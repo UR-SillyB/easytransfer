@@ -27,8 +27,11 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Install Gradle CLI
-        run: sudo apt-get update && sudo apt-get install -y gradle
+      - name: Install Gradle 8.7
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip -O /tmp/gradle-8.7-bin.zip
+          sudo unzip -q -o /tmp/gradle-8.7-bin.zip -d /opt
+          echo "/opt/gradle-8.7/bin" >> $GITHUB_PATH
 
       - name: Make gradlew executable
         working-directory: apps/android-scanner
