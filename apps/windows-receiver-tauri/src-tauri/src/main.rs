@@ -4,11 +4,12 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
+use std::io::Write;
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +32,12 @@ struct ReceivedRec {
     data_b64: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AndroidPayloadRec {
+    symbol_id: Option<String>,
+    data_b64: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct Report {
     ok: bool,
@@ -38,6 +45,14 @@ struct Report {
     files_failed: Vec<String>,
     missing_source_symbols: Vec<String>,
     errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UploadReport {
+    ok: bool,
+    status_line: String,
+    bytes_sent: usize,
+    response_body: String,
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -86,20 +101,53 @@ fn decompress(codec: &str, data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[tauri::command]
+fn upload_to_android(android_addr: String, file_path: String) -> Result<UploadReport, String> {
+    let addr = if android_addr.contains(':') {
+        android_addr
+    } else {
+        format!("{}:18777", android_addr)
+    };
+
+    let payload = fs::read(&file_path).map_err(|e| format!("读取文件失败: {}", e))?;
+    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("连接 Android 失败: {}", e))?;
+
+    let request_head = format!(
+        "POST /upload HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        addr,
+        payload.len()
+    );
+    stream
+        .write_all(request_head.as_bytes())
+        .map_err(|e| format!("发送请求头失败: {}", e))?;
+    stream
+        .write_all(&payload)
+        .map_err(|e| format!("发送请求体失败: {}", e))?;
+    stream.flush().map_err(|e| format!("刷新发送失败: {}", e))?;
+
+    let mut resp = String::new();
+    stream
+        .read_to_string(&mut resp)
+        .map_err(|e| format!("读取响应失败: {}", e))?;
+
+    let mut lines = resp.lines();
+    let status_line = lines.next().unwrap_or("HTTP/1.1 000 UNKNOWN").to_string();
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    let ok = status_line.contains(" 200 ");
+
+    Ok(UploadReport {
+        ok,
+        status_line,
+        bytes_sent: payload.len(),
+        response_body: body,
+    })
+}
+
+#[tauri::command]
 fn reconstruct(received_path: String, manifest_path: String, output_dir: String) -> Result<Report, String> {
     let manifest_str = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
     let manifest: Manifest = serde_json::from_str(&manifest_str).map_err(|e| e.to_string())?;
 
-    let mut symbol_map: HashMap<String, Vec<u8>> = HashMap::new();
-    let received_text = fs::read_to_string(&received_path).map_err(|e| e.to_string())?;
-    for line in received_text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let rec: ReceivedRec = serde_json::from_str(line).map_err(|e| e.to_string())?;
-        let bytes = B64.decode(rec.data_b64).map_err(|e| e.to_string())?;
-        symbol_map.insert(rec.symbol_id, bytes);
-    }
+    let symbol_map = load_symbol_map(&received_path)?;
 
     let out_dir = PathBuf::from(output_dir);
     fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
@@ -169,9 +217,43 @@ fn reconstruct(received_path: String, manifest_path: String, output_dir: String)
     Ok(report)
 }
 
+fn load_symbol_map(path: &str) -> Result<HashMap<String, Vec<u8>>, String> {
+    let mut symbol_map: HashMap<String, Vec<u8>> = HashMap::new();
+    let received_text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+
+    let mut parsed_jsonl = false;
+    for line in received_text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(rec) = serde_json::from_str::<ReceivedRec>(line) {
+            let bytes = B64.decode(rec.data_b64).map_err(|e| e.to_string())?;
+            symbol_map.insert(rec.symbol_id, bytes);
+            parsed_jsonl = true;
+        }
+    }
+    if parsed_jsonl {
+        return Ok(symbol_map);
+    }
+
+    for line in received_text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(rec) = serde_json::from_str::<AndroidPayloadRec>(line) {
+            if let (Some(symbol_id), Some(data_b64)) = (rec.symbol_id, rec.data_b64) {
+                let bytes = B64.decode(data_b64).map_err(|e| e.to_string())?;
+                symbol_map.insert(symbol_id, bytes);
+            }
+        }
+    }
+
+    Ok(symbol_map)
+}
+
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![reconstruct])
+        .invoke_handler(tauri::generate_handler![reconstruct, upload_to_android])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

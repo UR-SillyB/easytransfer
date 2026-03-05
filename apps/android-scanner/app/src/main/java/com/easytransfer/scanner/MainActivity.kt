@@ -1,167 +1,191 @@
 package com.easytransfer.scanner
 
-import android.Manifest
-import android.content.pm.PackageManager
 import android.os.Bundle
-import android.util.Base64
 import android.widget.Button
 import android.widget.TextView
 import androidx.activity.ComponentActivity
-import androidx.camera.core.*
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
-import com.google.zxing.BinaryBitmap
-import com.google.zxing.MultiFormatReader
-import com.google.zxing.common.HybridBinarizer
-import com.google.zxing.PlanarYUVLuminanceSource
 import org.json.JSONObject
 import java.io.File
-import java.nio.ByteBuffer
+import java.io.OutputStream
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.net.ServerSocket
+import java.net.Socket
 import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var previewView: PreviewView
+    private lateinit var addressHint: TextView
     private lateinit var statusText: TextView
+    private lateinit var startServiceButton: Button
+    private lateinit var stopServiceButton: Button
     private lateinit var exportButton: Button
 
-    private val cameraExecutor = Executors.newSingleThreadExecutor()
-    private val decoder = MultiFormatReader()
+    private val ioExecutor = Executors.newSingleThreadExecutor()
+    private var serverSocket: ServerSocket? = null
     private val session = mutableListOf<String>()
-    private val seenIds = hashSetOf<String>()
+    private val outputBuffer = StringBuilder()
+    private var receivedBytes: Long = 0L
+    private val port = 18777
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        previewView = findViewById(R.id.previewView)
+        addressHint = findViewById(R.id.addressHint)
         statusText = findViewById(R.id.statusText)
+        startServiceButton = findViewById(R.id.startServiceButton)
+        stopServiceButton = findViewById(R.id.stopServiceButton)
         exportButton = findViewById(R.id.exportButton)
 
-        exportButton.setOnClickListener {
-            exportSession()
-        }
+        startServiceButton.setOnClickListener { startService() }
+        stopServiceButton.setOnClickListener { stopService() }
+        exportButton.setOnClickListener { exportSession() }
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            startCamera()
-        } else {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 1001)
-        }
+        updateAddressHint()
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 1001 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            startCamera()
-        } else {
-            statusText.text = "Camera permission denied"
+    override fun onDestroy() {
+        super.onDestroy()
+        stopService()
+        ioExecutor.shutdownNow()
+    }
+
+    private fun updateAddressHint() {
+        val ip = getLocalIpv4Address() ?: "未知"
+        addressHint.text = "服务地址：http://$ip:$port/upload"
+    }
+
+    private fun startService() {
+        if (serverSocket != null) {
+            statusText.text = "服务已在运行"
+            return
         }
-    }
-
-    private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
-
-            val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider(previewView.surfaceProvider)
-            }
-
-            val analyzer = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-                .also {
-                    it.setAnalyzer(cameraExecutor, FrameAnalyzer { payload ->
-                        processPayload(payload)
-                    })
-                }
-
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-            cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(this, cameraSelector, preview, analyzer)
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun processPayload(payload: String) {
-        runOnUiThread {
+        ioExecutor.execute {
             try {
-                val obj = JSONObject(payload)
-                val symbolId = obj.optString("symbol_id")
-                if (symbolId.isNotBlank() && !seenIds.contains(symbolId)) {
-                    seenIds.add(symbolId)
-                    val out = JSONObject()
-                    out.put("symbol_id", symbolId)
-                    out.put("data_b64", obj.optString("payload_b64"))
-                    out.put("file_id", obj.optInt("fileId", -1))
-                    out.put("block", obj.optInt("block", -1))
-                    out.put("symbol", obj.optInt("symbol", -1))
-                    out.put("redundant", obj.optBoolean("redundant", false))
-                    session.add(out.toString())
-                    statusText.text = "Captured: ${seenIds.size} symbols"
+                val ss = ServerSocket(port)
+                serverSocket = ss
+                runOnUiThread { statusText.text = "服务已启动，等待 Windows 连接..." }
+                while (!ss.isClosed) {
+                    val client = ss.accept()
+                    handleClient(client)
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                runOnUiThread { statusText.text = "服务异常：${e.message}" }
+            } finally {
+                serverSocket = null
             }
         }
+    }
+
+    private fun stopService() {
+        try {
+            serverSocket?.close()
+            serverSocket = null
+            statusText.text = "服务已停止"
+        } catch (e: Exception) {
+            statusText.text = "停止失败：${e.message}"
+        }
+    }
+
+    private fun handleClient(socket: Socket) {
+        socket.use { s ->
+            val request = s.getInputStream().bufferedReader(Charsets.UTF_8)
+            val firstLine = request.readLine() ?: return
+            val headers = mutableMapOf<String, String>()
+            while (true) {
+                val line = request.readLine() ?: break
+                if (line.isBlank()) break
+                val idx = line.indexOf(':')
+                if (idx > 0) {
+                    headers[line.substring(0, idx).trim().lowercase()] = line.substring(idx + 1).trim()
+                }
+            }
+
+            if (!firstLine.startsWith("POST /upload")) {
+                writeHttp(s.getOutputStream(), 404, "Not Found", "仅支持 POST /upload")
+                return
+            }
+
+            val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
+            if (contentLength <= 0) {
+                writeHttp(s.getOutputStream(), 400, "Bad Request", "缺少内容")
+                return
+            }
+
+            val bodyBytes = CharArray(contentLength)
+            var totalRead = 0
+            while (totalRead < contentLength) {
+                val n = request.read(bodyBytes, totalRead, contentLength - totalRead)
+                if (n <= 0) break
+                totalRead += n
+            }
+
+            val payload = String(bodyBytes, 0, totalRead)
+            receivedBytes += totalRead
+            session.add(payload)
+            outputBuffer.append(payload).append("\n")
+
+            runOnUiThread {
+                statusText.text = "已接收 ${session.size} 段，累计 ${receivedBytes} 字节"
+            }
+
+            val response = JSONObject()
+            response.put("ok", true)
+            response.put("received_segments", session.size)
+            response.put("received_bytes", receivedBytes)
+            writeHttp(s.getOutputStream(), 200, "OK", response.toString())
+        }
+    }
+
+    private fun writeHttp(out: OutputStream, code: Int, reason: String, body: String) {
+        val bytes = body.toByteArray(Charsets.UTF_8)
+        val header = "HTTP/1.1 $code $reason\r\n" +
+            "Content-Type: application/json; charset=utf-8\r\n" +
+            "Content-Length: ${bytes.size}\r\n" +
+            "Connection: close\r\n\r\n"
+        out.write(header.toByteArray(Charsets.UTF_8))
+        out.write(bytes)
+        out.flush()
     }
 
     private fun exportSession() {
         try {
-            val outDir = File(getExternalFilesDir(null), "session")
+            val outDir = File(getExternalFilesDir(null), "service-session")
             outDir.mkdirs()
-            val received = File(outDir, "received.jsonl")
-            received.writeText(session.joinToString("\n", postfix = if (session.isEmpty()) "" else "\n"))
+            val received = File(outDir, "received_payloads.txt")
+            received.writeText(outputBuffer.toString())
 
-            val feedback = File(outDir, "feedback.json")
-            val fb = JSONObject()
-            fb.put("captured", seenIds.size)
-            fb.put("recommendation", JSONObject().put("note", "Use receiver to detect missing symbols and request补传"))
-            feedback.writeText(fb.toString(2))
+            val report = JSONObject()
+            report.put("segments", session.size)
+            report.put("received_bytes", receivedBytes)
+            report.put("note", "Windows 端已通过地址上传成功")
 
-            statusText.text = "Exported to: ${outDir.absolutePath}"
+            val feedback = File(outDir, "service_report.json")
+            feedback.writeText(report.toString(2))
+
+            statusText.text = "已导出：${outDir.absolutePath}"
         } catch (e: Exception) {
-            statusText.text = "Export failed: ${e.message}"
+            statusText.text = "导出失败：${e.message}"
         }
     }
-}
 
-private class FrameAnalyzer(
-    private val onPayload: (String) -> Unit,
-) : ImageAnalysis.Analyzer {
-    private val reader = MultiFormatReader()
-
-    override fun analyze(image: ImageProxy) {
-        val mediaImage = image.image
-        if (mediaImage != null) {
-            try {
-                val plane = image.planes[0]
-                val data = plane.buffer.toByteArray()
-                val source = PlanarYUVLuminanceSource(
-                    data,
-                    image.width,
-                    image.height,
-                    0,
-                    0,
-                    image.width,
-                    image.height,
-                    false
-                )
-                val bitmap = BinaryBitmap(HybridBinarizer(source))
-                val result = reader.decodeWithState(bitmap)
-                onPayload(result.text)
-            } catch (_: Exception) {
-            } finally {
-                reader.reset()
+    private fun getLocalIpv4Address(): String? {
+        return try {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
+            while (interfaces.hasMoreElements()) {
+                val nif = interfaces.nextElement()
+                val addresses = nif.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val addr = addresses.nextElement()
+                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                        return addr.hostAddress
+                    }
+                }
             }
+            null
+        } catch (_: Exception) {
+            null
         }
-        image.close()
     }
-}
-
-private fun ByteBuffer.toByteArray(): ByteArray {
-    rewind()
-    val data = ByteArray(remaining())
-    get(data)
-    return data
 }

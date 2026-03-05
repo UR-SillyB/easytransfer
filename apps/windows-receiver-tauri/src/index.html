@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>EasyTransfer Receiver</title>
+    <title>易传 Windows 接收端</title>
     <style>
       body { font-family: Arial, sans-serif; margin: 20px; }
       .row { margin-bottom: 10px; }
@@ -14,21 +14,26 @@
     </style>
   </head>
   <body>
-    <h2>EasyTransfer Windows Receiver (Tauri)</h2>
+    <h2>易传 Windows 接收端（Tauri）</h2>
     <div class="row">
-      <label>received.jsonl</label>
-      <input id="receivedPath" placeholder="C:\\...\\received.jsonl" />
+      <label>Android 服务地址（示例：192.168.1.10:18777）</label>
+      <input id="androidAddr" placeholder="192.168.1.10:18777" />
     </div>
     <div class="row">
-      <label>manifest.json</label>
+      <label>manifest.json 路径</label>
       <input id="manifestPath" placeholder="C:\\...\\manifest.json" />
     </div>
     <div class="row">
-      <label>output folder</label>
+      <label>输出目录</label>
       <input id="outputDir" placeholder="C:\\...\\output" />
     </div>
     <div class="row">
-      <button id="runBtn">Reconstruct</button>
+      <label>待发送文件（由 Windows 上传给 Android）</label>
+      <input id="uploadFilePath" placeholder="C:\\...\\to-send.bin" />
+    </div>
+    <div class="row">
+      <button id="sendBtn">发送到 Android</button>
+      <button id="runBtn">执行重组</button>
     </div>
     <pre id="log"></pre>
     <script type="module" src="./main.js"></script>

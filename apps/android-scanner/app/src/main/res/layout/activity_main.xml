@@ -9,28 +9,44 @@
         android:id="@+id/titleText"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="EasyTransfer Scanner"
+        android:text="易传安卓端（服务模式）"
         android:textSize="20sp"
         android:textStyle="bold" />
 
-    <androidx.camera.view.PreviewView
-        android:id="@+id/previewView"
+    <TextView
+        android:id="@+id/addressHint"
         android:layout_width="match_parent"
-        android:layout_height="240dp"
-        android:layout_marginTop="8dp" />
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="服务地址：未启动"
+        android:textSize="14sp" />
 
     <TextView
         android:id="@+id/statusText"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:text="Waiting for scan..." />
+        android:text="等待启动服务..." />
+
+    <Button
+        android:id="@+id/startServiceButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="启动接收服务" />
+
+    <Button
+        android:id="@+id/stopServiceButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="停止接收服务" />
 
     <Button
         android:id="@+id/exportButton"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:text="Export Session JSONL" />
+        android:text="导出接收结果" />
 
 </LinearLayout>

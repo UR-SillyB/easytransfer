@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>EasyTransfer Sender</title>
+    <title>易传发送端</title>
     <style>
       body { font-family: Arial, sans-serif; width: 360px; padding: 12px; }
       .row { margin-bottom: 10px; }
@@ -14,31 +14,31 @@
     </style>
   </head>
   <body>
-    <h3>EasyTransfer Sender</h3>
+    <h3>易传发送端</h3>
     <div class="row">
-      <label for="fileInput">Select files</label>
+      <label for="fileInput">选择文件</label>
       <input id="fileInput" type="file" multiple />
     </div>
     <div class="row">
-      <label for="fpsInput">FPS</label>
+      <label for="fpsInput">帧率 FPS</label>
       <input id="fpsInput" type="number" min="1" max="60" value="30" />
     </div>
     <div class="row">
-      <label for="symbolInput">Symbol size (bytes)</label>
+      <label for="symbolInput">符号大小（字节）</label>
       <input id="symbolInput" type="number" min="128" max="4096" value="1024" />
     </div>
     <div class="row">
-      <label for="redundancyInput">Redundancy ratio</label>
+      <label for="redundancyInput">冗余比例</label>
       <input id="redundancyInput" type="number" min="0" max="2" step="0.05" value="0.2" />
     </div>
     <div class="row">
-      <button id="prepareBtn">Prepare Frames</button>
+      <button id="prepareBtn">生成码帧</button>
     </div>
     <div class="row">
-      <button id="startBtn" disabled>Start Playback</button>
+      <button id="startBtn" disabled>开始播放</button>
     </div>
     <div class="row">
-      <button id="stopBtn" disabled>Stop</button>
+      <button id="stopBtn" disabled>停止</button>
     </div>
     <canvas id="frameCanvas" width="320" height="320"></canvas>
     <pre id="log"></pre>

@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "EasyTransfer Sender",
+  "name": "易传发送端",
   "version": "0.1.0",
-  "description": "Offline high-speed frame sender for EasyTransfer",
+  "description": "离线高速码帧发送扩展",
   "permissions": ["storage"],
   "action": {
-    "default_title": "EasyTransfer Sender",
+    "default_title": "易传发送端",
     "default_popup": "popup.html"
   },
   "icons": {

@@ -97,7 +97,7 @@ function drawFrameText(text) {
 async function prepareFrames() {
   const files = [...fileInput.files];
   if (!files.length) {
-    log('No files selected');
+    log('未选择文件');
     return;
   }
   const symbolSize = Math.max(128, Number(symbolInput.value || 1024));
@@ -157,11 +157,11 @@ async function prepareFrames() {
       source_symbol_ids: sourceIds,
       compressed_bytes: compressed.payload.byteLength,
     }));
-    log(`Prepared ${file.name} -> symbols=${k}, repairs=${repairCount}, codec=${compressed.codec}`);
+    log(`已处理 ${file.name} -> 源符号=${k}，修复符号=${repairCount}，压缩=${compressed.codec}`);
     fileId += 1;
   }
   startBtn.disabled = false;
-  log(`Prepared total frames: ${frames.length}`);
+  log(`码帧总数：${frames.length}`);
 }
 
 function startPlayback() {
@@ -177,7 +177,7 @@ function startPlayback() {
     drawFrameText(frame);
     frameIndex += 1;
   }, interval);
-  log(`Playback started at ${fps} FPS`);
+  log(`已开始播放，帧率 ${fps} FPS`);
 }
 
 function stopPlayback() {
@@ -185,11 +185,11 @@ function stopPlayback() {
   timer = null;
   startBtn.disabled = false;
   stopBtn.disabled = true;
-  log('Playback stopped');
+  log('已停止播放');
 }
 
 prepareBtn.addEventListener('click', () => {
-  prepareFrames().catch(err => log(`prepare error: ${err.message || err}`));
+  prepareFrames().catch(err => log(`生成失败：${err.message || err}`));
 });
 startBtn.addEventListener('click', startPlayback);
 stopBtn.addEventListener('click', stopPlayback);
