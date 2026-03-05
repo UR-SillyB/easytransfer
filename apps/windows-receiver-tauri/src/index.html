@@ -5,42 +5,69 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>易传 Windows 接收端</title>
     <style>
-      body { font-family: Arial, sans-serif; margin: 20px; }
+      body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; background: #f4f7fb; color: #1a2433; }
+      .wrap { max-width: 980px; margin: 0 auto; padding: 14px; }
+      .card { background: #fff; border-radius: 14px; box-shadow: 0 3px 12px rgba(0,0,0,.06); padding: 12px; margin-bottom: 12px; }
+      .title { margin: 0 0 10px; font-size: 20px; }
       .row { margin-bottom: 10px; }
-      label { display:block; font-size: 12px; margin-bottom: 4px; }
-      input { width: 100%; padding: 6px; box-sizing: border-box; }
-      button { padding: 8px 12px; margin-right: 8px; }
-      pre { background:#111; color:#0f0; padding:10px; max-height:320px; overflow:auto; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+      label { display:block; font-size: 12px; color: #52627a; margin-bottom: 4px; }
+      input { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #d8e0ea; border-radius: 8px; }
+      button { padding: 9px 12px; border-radius: 8px; border: 0; background: #2f7cff; color: #fff; font-weight: 600; }
+      button.secondary { background: #ecf2fb; color: #24364f; }
+      .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+      pre { background:#0d1422; color:#9ae987; padding:10px; border-radius: 8px; max-height:320px; overflow:auto; }
     </style>
   </head>
   <body>
-    <h2>易传 Windows 接收端（Tauri）</h2>
-    <div class="row">
-      <label>监听地址（示例：0.0.0.0:18778）</label>
-      <input id="listenAddr" placeholder="0.0.0.0:18778" value="0.0.0.0:18778" />
+    <div class="wrap">
+      <div class="card">
+        <h2 class="title">易传 Windows 接收端</h2>
+        <div class="grid">
+          <div class="row">
+            <label>监听地址（示例：0.0.0.0:18778）</label>
+            <input id="listenAddr" placeholder="0.0.0.0:18778" value="0.0.0.0:18778" />
+          </div>
+          <div class="row">
+            <label>接收状态</label>
+            <input id="statusText" placeholder="未启动" readonly />
+          </div>
+        </div>
+        <div class="row">
+          <label>接收文件保存路径（JSONL）</label>
+          <div class="actions">
+            <input id="receivedPath" placeholder="请选择保存 received.jsonl 的路径" style="flex:1; min-width: 360px;" />
+            <button id="pickReceivedBtn" class="secondary">选择文件</button>
+          </div>
+        </div>
+        <div class="actions">
+          <button id="startBtn">启动接收服务</button>
+          <button id="stopBtn" class="secondary">停止接收服务</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <label>manifest.json 路径（解码重组）</label>
+          <div class="actions">
+            <input id="manifestPath" placeholder="请选择 manifest.json" style="flex:1; min-width: 360px;" />
+            <button id="pickManifestBtn" class="secondary">选择文件</button>
+          </div>
+        </div>
+        <div class="row">
+          <label>输出目录</label>
+          <div class="actions">
+            <input id="outputDir" placeholder="请选择输出目录" style="flex:1; min-width: 360px;" />
+            <button id="pickOutputBtn" class="secondary">选择目录</button>
+          </div>
+        </div>
+        <button id="runBtn">执行重组</button>
+      </div>
+
+      <div class="card">
+        <pre id="log"></pre>
+      </div>
     </div>
-    <div class="row">
-      <label>接收文件保存路径（JSONL）</label>
-      <input id="receivedPath" placeholder="C:\\...\\received.jsonl" />
-    </div>
-    <div class="row">
-      <label>manifest.json 路径（重组时使用）</label>
-      <input id="manifestPath" placeholder="C:\\...\\manifest.json" />
-    </div>
-    <div class="row">
-      <label>输出目录</label>
-      <input id="outputDir" placeholder="C:\\...\\output" />
-    </div>
-    <div class="row">
-      <label>接收状态</label>
-      <input id="statusText" placeholder="未启动" readonly />
-    </div>
-    <div class="row">
-      <button id="startBtn">启动接收服务</button>
-      <button id="stopBtn">停止接收服务</button>
-      <button id="runBtn">执行重组</button>
-    </div>
-    <pre id="log"></pre>
     <script type="module" src="./main.js"></script>
   </body>
   </html>

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use tauri::api::dialog::blocking::FileDialogBuilder;
 
 #[derive(Debug, Deserialize)]
 struct ManifestFile {
@@ -356,13 +357,35 @@ fn write_http(stream: &mut TcpStream, code: u16, reason: &str, body: &str) -> Re
     Ok(())
 }
 
+#[tauri::command]
+fn pick_file(filter_ext: String) -> Result<String, String> {
+    let mut builder = FileDialogBuilder::new();
+    if !filter_ext.trim().is_empty() {
+        builder = builder.add_filter("文件", &[filter_ext.as_str()]);
+    }
+    let picked = builder.pick_file();
+    Ok(picked
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+fn pick_folder() -> Result<String, String> {
+    let picked = FileDialogBuilder::new().pick_folder();
+    Ok(picked
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default())
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(Mutex::new(ReceiverServerState::default()))
         .invoke_handler(tauri::generate_handler![
             reconstruct,
             start_receiver_server,
-            stop_receiver_server
+            stop_receiver_server,
+            pick_file,
+            pick_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

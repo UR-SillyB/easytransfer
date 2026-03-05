@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:fillViewport="true">
+
+<LinearLayout
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
     android:orientation="vertical"
     android:padding="12dp">
 
@@ -32,14 +37,21 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:text="等待扫码..." />
+        android:text="阶段：等待扫码..." />
+
+    <TextView
+        android:id="@+id/missingHint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:text="缺失分片：尚未统计" />
 
     <Button
         android:id="@+id/startScanButton"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:text="开始扫码并上传" />
+        android:text="开始扫码" />
 
     <Button
         android:id="@+id/stopScanButton"
@@ -49,10 +61,19 @@
         android:text="停止扫码" />
 
     <Button
+        android:id="@+id/finalizeButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="校验缺失并上传到 Windows" />
+
+    <Button
         android:id="@+id/exportButton"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:text="导出上传日志" />
+        android:text="导出缺失与上传日志" />
 
 </LinearLayout>
+
+</ScrollView>

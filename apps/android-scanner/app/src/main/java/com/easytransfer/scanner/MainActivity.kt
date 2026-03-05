@@ -19,6 +19,7 @@ import com.google.zxing.BinaryBitmap
 import com.google.zxing.MultiFormatReader
 import com.google.zxing.PlanarYUVLuminanceSource
 import com.google.zxing.common.HybridBinarizer
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.OutputStream
@@ -32,17 +33,22 @@ class MainActivity : ComponentActivity() {
     private lateinit var windowsAddrInput: EditText
     private lateinit var previewView: PreviewView
     private lateinit var statusText: TextView
+    private lateinit var missingHint: TextView
     private lateinit var startScanButton: Button
     private lateinit var stopScanButton: Button
+    private lateinit var finalizeButton: Button
     private lateinit var exportButton: Button
 
     private val cameraExecutor = Executors.newSingleThreadExecutor()
-    private val uploadExecutor = Executors.newSingleThreadExecutor()
-    private val session = mutableListOf<String>()
-    private val seenIds = hashSetOf<String>()
-    private var scannedCount = 0
-    private var uploadedCount = 0
+    private val ioExecutor = Executors.newSingleThreadExecutor()
     private var isScanning = false
+
+    private var transferId: String? = null
+    private val symbolMap = linkedMapOf<String, JSONObject>()
+    private val expectedByBlock = linkedMapOf<String, Int>()
+    private val allSeenByBlock = linkedMapOf<String, MutableSet<Int>>()
+    private val missingSymbolIds = linkedSetOf<String>()
+    private var uploadedCount = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -51,19 +57,22 @@ class MainActivity : ComponentActivity() {
         windowsAddrInput = findViewById(R.id.windowsAddrInput)
         previewView = findViewById(R.id.previewView)
         statusText = findViewById(R.id.statusText)
+        missingHint = findViewById(R.id.missingHint)
         startScanButton = findViewById(R.id.startScanButton)
         stopScanButton = findViewById(R.id.stopScanButton)
+        finalizeButton = findViewById(R.id.finalizeButton)
         exportButton = findViewById(R.id.exportButton)
 
         startScanButton.setOnClickListener { startScan() }
         stopScanButton.setOnClickListener { stopScan() }
-        exportButton.setOnClickListener { exportSession() }
+        finalizeButton.setOnClickListener { finalizeAndUpload() }
+        exportButton.setOnClickListener { exportLogs() }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdownNow()
-        uploadExecutor.shutdownNow()
+        ioExecutor.shutdownNow()
     }
 
     private fun startScan() {
@@ -72,7 +81,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (isScanning) {
-            statusText.text = "正在扫码中"
+            statusText.text = "阶段：扫码中"
             return
         }
         isScanning = true
@@ -84,13 +93,11 @@ class MainActivity : ComponentActivity() {
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
                 .also {
-                    it.setAnalyzer(cameraExecutor, FrameAnalyzer { payload ->
-                        onPayloadDecoded(payload)
-                    })
+                    it.setAnalyzer(cameraExecutor, FrameAnalyzer { payload -> onPayloadDecoded(payload) })
                 }
             provider.unbindAll()
             provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analyzer)
-            statusText.text = "已开始扫码，等待码帧..."
+            statusText.text = "阶段：扫码采集中"
         }, ContextCompat.getMainExecutor(this))
     }
 
@@ -99,7 +106,7 @@ class MainActivity : ComponentActivity() {
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
             providerFuture.get().unbindAll()
-            statusText.text = "已停止扫码"
+            statusText.text = "阶段：扫码停止，等待校验"
         }, ContextCompat.getMainExecutor(this))
     }
 
@@ -107,43 +114,81 @@ class MainActivity : ComponentActivity() {
         if (!isScanning) return
         try {
             val obj = JSONObject(payload)
-            if (obj.optString("kind") != "symbol") {
-                return
-            }
-            val symbolId = obj.optString("symbol_id")
-            if (symbolId.isBlank() || seenIds.contains(symbolId)) {
-                return
-            }
-            seenIds.add(symbolId)
-            scannedCount += 1
+            if (obj.optString("kind") != "symbol") return
 
-            val windowsAddr = windowsAddrInput.text?.toString()?.trim().orEmpty()
-            if (windowsAddr.isBlank()) {
-                runOnUiThread { statusText.text = "请先填写 Windows 地址" }
-                return
+            val sid = obj.optString("stable_symbol_id")
+            if (sid.isBlank()) return
+
+            val tid = obj.optString("transfer_id")
+            if (transferId == null && tid.isNotBlank()) transferId = tid
+            if (transferId != null && tid.isNotBlank() && tid != transferId) return
+
+            if (symbolMap.containsKey(sid)) return
+            symbolMap[sid] = obj
+
+            val blockKey = "f${obj.optInt("file_id", -1)}:b${obj.optInt("block_id", -1)}"
+            val symbolId = obj.optInt("symbol_id", -1)
+            val expected = obj.optInt("symbol_total", -1)
+            if (expected > 0) expectedByBlock[blockKey] = maxOf(expectedByBlock[blockKey] ?: 0, expected)
+            if (symbolId >= 0) {
+                allSeenByBlock.getOrPut(blockKey) { linkedSetOf() }.add(symbolId)
             }
 
-            val uploadObj = JSONObject()
-            uploadObj.put("symbol_id", symbolId)
-            uploadObj.put("data_b64", obj.optString("payload_b64"))
-            uploadObj.put("file_id", obj.optInt("fileId", -1))
-            uploadObj.put("block", obj.optInt("block", -1))
-            uploadObj.put("symbol", obj.optInt("symbol", -1))
-            uploadObj.put("redundant", obj.optBoolean("redundant", false))
-
-            uploadExecutor.execute {
-                val ok = uploadToWindows(windowsAddr, uploadObj.toString())
-                runOnUiThread {
-                    if (ok) {
-                        uploadedCount += 1
-                        session.add(uploadObj.toString())
-                        statusText.text = "扫码 $scannedCount，已上传 $uploadedCount"
-                    } else {
-                        statusText.text = "上传失败，等待下一帧"
-                    }
-                }
+            runOnUiThread {
+                statusText.text = "阶段：扫码采集中，已收 ${symbolMap.size} 分片"
             }
         } catch (_: Exception) {
+        }
+    }
+
+    private fun rebuildMissing() {
+        missingSymbolIds.clear()
+        for ((blockKey, expected) in expectedByBlock) {
+            if (expected <= 0) continue
+            val seen = allSeenByBlock[blockKey] ?: emptySet<Int>()
+            val prefix = transferId ?: "unknown"
+            for (i in 0 until expected) {
+                if (!seen.contains(i)) {
+                    missingSymbolIds.add("$prefix:${blockKey}:s$i")
+                }
+            }
+        }
+    }
+
+    private fun finalizeAndUpload() {
+        stopScan()
+        rebuildMissing()
+        missingHint.text = "缺失分片：${missingSymbolIds.size}"
+        if (missingSymbolIds.isNotEmpty()) {
+            statusText.text = "阶段：校验未通过，请补扫缺失分片"
+            return
+        }
+
+        val windowsAddr = windowsAddrInput.text?.toString()?.trim().orEmpty()
+        if (windowsAddr.isBlank()) {
+            statusText.text = "请填写 Windows 地址"
+            return
+        }
+
+        statusText.text = "阶段：校验通过，开始上传"
+        uploadedCount = 0
+        ioExecutor.execute {
+            val values = symbolMap.values.toList()
+            for (obj in values) {
+                val rec = JSONObject()
+                rec.put("symbol_id", obj.optString("stable_symbol_id"))
+                rec.put("data_b64", obj.optString("payload_b64"))
+                rec.put("file_id", obj.optInt("file_id", -1))
+                rec.put("block", obj.optInt("block_id", -1))
+                rec.put("symbol", obj.optInt("symbol_id", -1))
+                rec.put("redundant", obj.optBoolean("is_repair", false))
+
+                val ok = uploadToWindows(windowsAddr, rec.toString())
+                if (ok) uploadedCount += 1
+            }
+            runOnUiThread {
+                statusText.text = "阶段：上传完成，成功 $uploadedCount / ${symbolMap.size}"
+            }
         }
     }
 
@@ -154,8 +199,7 @@ class MainActivity : ComponentActivity() {
             } else {
                 "http://$addr/upload-symbol"
             }
-            val url = URL(endpoint)
-            val conn = (url.openConnection() as HttpURLConnection)
+            val conn = (URL(endpoint).openConnection() as HttpURLConnection)
             conn.requestMethod = "POST"
             conn.connectTimeout = 3000
             conn.readTimeout = 5000
@@ -164,24 +208,41 @@ class MainActivity : ComponentActivity() {
             val bytes = payload.toByteArray(Charsets.UTF_8)
             conn.setRequestProperty("Content-Length", bytes.size.toString())
             conn.outputStream.use { out: OutputStream -> out.write(bytes) }
-            val code = conn.responseCode
-            code in 200..299
+            conn.responseCode in 200..299
         } catch (_: Exception) {
             false
         }
     }
 
-    private fun exportSession() {
+    private fun exportLogs() {
         try {
-            val outDir = File(getExternalFilesDir(null), "scan-upload-session")
+            val outDir = File(getExternalFilesDir(null), "scan-validate-upload")
             outDir.mkdirs()
-            val jsonl = File(outDir, "uploaded_symbols.jsonl")
-            jsonl.writeText(session.joinToString("\n", postfix = if (session.isEmpty()) "" else "\n"))
+
+            val uploaded = File(outDir, "validated_symbols.jsonl")
+            val lines = symbolMap.values.map {
+                JSONObject().apply {
+                    put("symbol_id", it.optString("stable_symbol_id"))
+                    put("data_b64", it.optString("payload_b64"))
+                    put("file_id", it.optInt("file_id", -1))
+                    put("block", it.optInt("block_id", -1))
+                    put("symbol", it.optInt("symbol_id", -1))
+                    put("redundant", it.optBoolean("is_repair", false))
+                }.toString()
+            }
+            uploaded.writeText(lines.joinToString("\n", postfix = if (lines.isEmpty()) "" else "\n"))
+
+            val missing = JSONObject()
+            missing.put("transfer_id", transferId ?: "")
+            val arr = JSONArray()
+            missingSymbolIds.forEach { arr.put(it) }
+            missing.put("missing_symbol_ids", arr)
+            File(outDir, "missing_symbols.json").writeText(missing.toString(2))
 
             val report = JSONObject()
-            report.put("scanned", scannedCount)
-            report.put("uploaded", uploadedCount)
-            report.put("note", "Android 已扫码并上传至 Windows")
+            report.put("scanned_symbols", symbolMap.size)
+            report.put("missing_symbols", missingSymbolIds.size)
+            report.put("uploaded_symbols", uploadedCount)
             File(outDir, "upload_report.json").writeText(report.toString(2))
 
             statusText.text = "已导出：${outDir.absolutePath}"

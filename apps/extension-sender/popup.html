@@ -5,43 +5,79 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>易传发送端</title>
     <style>
-      body { font-family: Arial, sans-serif; width: 360px; padding: 12px; }
-      .row { margin-bottom: 10px; }
-      label { display: block; font-size: 12px; margin-bottom: 4px; }
-      input, button, select { width: 100%; box-sizing: border-box; padding: 6px; }
-      #frameCanvas { width: 100%; border: 1px solid #ddd; }
-      pre { max-height: 180px; overflow: auto; background: #111; color: #0f0; padding: 8px; font-size: 11px; }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; width: 390px; margin: 0; background: #f6f8fb; color: #18212f; }
+      .wrap { padding: 12px; }
+      .card { background: #fff; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,.06); padding: 10px; margin-bottom: 10px; }
+      .row { margin-bottom: 8px; }
+      label { display: block; font-size: 12px; color: #4b5d75; margin-bottom: 4px; }
+      input, button, textarea { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 8px; border: 1px solid #d7dfea; }
+      button { background: #2f7cff; color: #fff; font-weight: 600; border: none; }
+      button.secondary { background: #eef2f9; color: #2a3a50; }
+      button:disabled { opacity: .55; }
+      .inline { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      #frameCanvas { width: 100%; border-radius: 8px; border: 1px solid #dde4ef; background: #fff; }
+      pre { max-height: 160px; overflow: auto; background: #0c1320; color: #9de28c; border-radius: 8px; padding: 8px; font-size: 11px; }
+      .title { margin: 0 0 8px; font-size: 16px; }
+      .hint { font-size: 11px; color: #5d7190; }
     </style>
   </head>
   <body>
-    <h3>易传发送端</h3>
-    <div class="row">
-      <label for="fileInput">选择文件</label>
-      <input id="fileInput" type="file" multiple />
+    <div class="wrap">
+      <div class="card">
+        <h3 class="title">易传发送端</h3>
+        <div class="row">
+          <label for="fileInput">上传文件</label>
+          <input id="fileInput" type="file" multiple />
+        </div>
+        <div class="inline">
+          <div class="row">
+            <label for="fpsInput">帧率 FPS</label>
+            <input id="fpsInput" type="number" min="1" max="60" value="30" />
+          </div>
+          <div class="row">
+            <label for="symbolInput">分片大小（字节）</label>
+            <input id="symbolInput" type="number" min="128" max="4096" value="1024" />
+          </div>
+        </div>
+        <div class="inline">
+          <div class="row">
+            <label for="blockInput">块大小（字节）</label>
+            <input id="blockInput" type="number" min="4096" max="1048576" value="65536" />
+          </div>
+          <div class="row">
+            <label for="redundancyInput">冗余比例</label>
+            <input id="redundancyInput" type="number" min="0" max="2" step="0.05" value="0.2" />
+          </div>
+        </div>
+        <div class="inline">
+          <button id="prepareBtn">生成码帧</button>
+          <button id="exportMissingBtn" class="secondary">导出分片索引</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <label for="missingInput">缺失分片 JSON（粘贴后快速补传）</label>
+          <textarea id="missingInput" rows="3" placeholder='{"missing_symbol_ids":["tid:f0:b0:s1"]}'></textarea>
+        </div>
+        <div class="inline">
+          <button id="startBtn" disabled>开始播放全部</button>
+          <button id="repairBtn" class="secondary" disabled>仅播放缺失分片</button>
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <button id="stopBtn" class="secondary" disabled>停止</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <canvas id="frameCanvas" width="320" height="320"></canvas>
+        <div class="hint" id="stats">待生成</div>
+      </div>
+
+      <div class="card">
+        <pre id="log"></pre>
+      </div>
     </div>
-    <div class="row">
-      <label for="fpsInput">帧率 FPS</label>
-      <input id="fpsInput" type="number" min="1" max="60" value="30" />
-    </div>
-    <div class="row">
-      <label for="symbolInput">符号大小（字节）</label>
-      <input id="symbolInput" type="number" min="128" max="4096" value="1024" />
-    </div>
-    <div class="row">
-      <label for="redundancyInput">冗余比例</label>
-      <input id="redundancyInput" type="number" min="0" max="2" step="0.05" value="0.2" />
-    </div>
-    <div class="row">
-      <button id="prepareBtn">生成码帧</button>
-    </div>
-    <div class="row">
-      <button id="startBtn" disabled>开始播放</button>
-    </div>
-    <div class="row">
-      <button id="stopBtn" disabled>停止</button>
-    </div>
-    <canvas id="frameCanvas" width="320" height="320"></canvas>
-    <pre id="log"></pre>
     <script src="popup.js"></script>
   </body>
   </html>

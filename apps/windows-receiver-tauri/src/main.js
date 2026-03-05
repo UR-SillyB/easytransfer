@@ -3,6 +3,9 @@ const statusInput = document.getElementById('statusText');
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const runBtn = document.getElementById('runBtn');
+const pickReceivedBtn = document.getElementById('pickReceivedBtn');
+const pickManifestBtn = document.getElementById('pickManifestBtn');
+const pickOutputBtn = document.getElementById('pickOutputBtn');
 
 function log(msg) {
   logEl.textContent += `${msg}\n`;
@@ -15,14 +18,46 @@ function setStatus(text) {
 function getInvoke() {
   const tauriGlobal = window.__TAURI__;
   if (!tauriGlobal) {
-    throw new Error('未检测到 Tauri 运行时，请使用 Tauri 打包后的应用启动。');
+    throw new Error('未检测到 Tauri 运行时，请使用打包后的应用启动。');
   }
   const invoke = tauriGlobal?.tauri?.invoke || tauriGlobal?.core?.invoke || tauriGlobal?.invoke;
   if (typeof invoke !== 'function') {
-    throw new Error('Tauri invoke API 不可用，请确认应用版本与配置。');
+    throw new Error('Tauri invoke API 不可用。');
   }
   return invoke;
 }
+
+async function call(name, payload) {
+  const invoke = getInvoke();
+  return invoke(name, payload || {});
+}
+
+pickReceivedBtn.addEventListener('click', async () => {
+  try {
+    const path = await call('pick_file', { filterExt: 'jsonl' });
+    if (path) document.getElementById('receivedPath').value = path;
+  } catch (e) {
+    log(`选择文件失败：${e}`);
+  }
+});
+
+pickManifestBtn.addEventListener('click', async () => {
+  try {
+    const path = await call('pick_file', { filterExt: 'json' });
+    if (path) document.getElementById('manifestPath').value = path;
+  } catch (e) {
+    log(`选择文件失败：${e}`);
+  }
+});
+
+pickOutputBtn.addEventListener('click', async () => {
+  try {
+    const path = await call('pick_folder');
+    if (path) document.getElementById('outputDir').value = path;
+  } catch (e) {
+    log(`选择目录失败：${e}`);
+  }
+});
 
 startBtn.addEventListener('click', async () => {
   const listenAddr = document.getElementById('listenAddr').value.trim();
@@ -32,8 +67,7 @@ startBtn.addEventListener('click', async () => {
     return;
   }
   try {
-    const invoke = getInvoke();
-    const res = await invoke('start_receiver_server', { listenAddr, receivedPath });
+    const res = await call('start_receiver_server', { listenAddr, receivedPath });
     setStatus(`运行中：${listenAddr}`);
     log(JSON.stringify(res, null, 2));
   } catch (e) {
@@ -44,8 +78,7 @@ startBtn.addEventListener('click', async () => {
 
 stopBtn.addEventListener('click', async () => {
   try {
-    const invoke = getInvoke();
-    const res = await invoke('stop_receiver_server');
+    const res = await call('stop_receiver_server');
     setStatus('已停止');
     log(JSON.stringify(res, null, 2));
   } catch (e) {
@@ -57,15 +90,12 @@ runBtn.addEventListener('click', async () => {
   const receivedPath = document.getElementById('receivedPath').value.trim();
   const manifestPath = document.getElementById('manifestPath').value.trim();
   const outputDir = document.getElementById('outputDir').value.trim();
-
   if (!receivedPath || !manifestPath || !outputDir) {
     log('请填写重组所需路径');
     return;
   }
-
   try {
-    const invoke = getInvoke();
-    const res = await invoke('reconstruct', { receivedPath, manifestPath, outputDir });
+    const res = await call('reconstruct', { receivedPath, manifestPath, outputDir });
     log(JSON.stringify(res, null, 2));
   } catch (e) {
     log(`重组失败：${e}`);
