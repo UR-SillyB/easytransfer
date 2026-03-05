@@ -3,6 +3,7 @@ package com.easytransfer.scanner
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.content.SharedPreferences
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
@@ -33,6 +34,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var windowsAddrInput: EditText
     private lateinit var previewView: PreviewView
     private lateinit var statusText: TextView
+    private lateinit var controlInfoText: TextView
+    private lateinit var frameInfoText: TextView
     private lateinit var missingHint: TextView
     private lateinit var startScanButton: Button
     private lateinit var stopScanButton: Button
@@ -42,6 +45,7 @@ class MainActivity : ComponentActivity() {
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private var isScanning = false
+    private lateinit var prefs: SharedPreferences
 
     private var transferId: String? = null
     private val symbolMap = linkedMapOf<String, JSONObject>()
@@ -53,6 +57,10 @@ class MainActivity : ComponentActivity() {
     private val manifestChunks = linkedMapOf<Int, ByteArray>()
     private var manifestChunkTotal = 0
     private var manifestSha256: String? = null
+    private var controlMetaReady = false
+    private var controlFileName: String = ""
+    private var controlFileSize: Long = 0L
+    private var controlSymbolCount: Int = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -61,11 +69,19 @@ class MainActivity : ComponentActivity() {
         windowsAddrInput = findViewById(R.id.windowsAddrInput)
         previewView = findViewById(R.id.previewView)
         statusText = findViewById(R.id.statusText)
+        controlInfoText = findViewById(R.id.controlInfoText)
+        frameInfoText = findViewById(R.id.frameInfoText)
         missingHint = findViewById(R.id.missingHint)
         startScanButton = findViewById(R.id.startScanButton)
         stopScanButton = findViewById(R.id.stopScanButton)
         finalizeButton = findViewById(R.id.finalizeButton)
         exportButton = findViewById(R.id.exportButton)
+
+        prefs = getSharedPreferences("easytransfer_pref", MODE_PRIVATE)
+        val savedAddr = prefs.getString("windows_addr", "") ?: ""
+        if (savedAddr.isNotBlank()) {
+            windowsAddrInput.setText(savedAddr)
+        }
 
         startScanButton.setOnClickListener { startScan() }
         stopScanButton.setOnClickListener { stopScan() }
@@ -126,6 +142,9 @@ class MainActivity : ComponentActivity() {
             }
 
             if (kind != "symbol") return
+            runOnUiThread {
+                frameInfoText.text = "当前帧：#${obj.optInt("frame_seq", -1)} 文件${obj.optInt("file_id", -1)} 块${obj.optInt("block_id", -1)} 分片${obj.optInt("symbol_id", -1)}"
+            }
 
             val sid = obj.optString("stable_symbol_id")
             if (sid.isBlank()) return
@@ -153,14 +172,21 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun processManifestFrame(obj: JSONObject) {
-        val kind = obj.optString("kind")
-        when (kind) {
+            val kind = obj.optString("kind")
+            when (kind) {
             "manifest_start" -> {
                 manifestChunks.clear()
                 manifestChunkTotal = obj.optInt("chunk_total", 0)
                 manifestSha256 = obj.optString("manifest_sha256")
+                controlFileName = obj.optString("payload_name")
+                controlFileSize = obj.optLong("payload_size", 0L)
+                controlSymbolCount = obj.optInt("payload_symbol_count", 0)
+                controlMetaReady = controlFileName.isNotBlank() && controlFileSize > 0 && controlSymbolCount > 0
                 runOnUiThread {
                     statusText.text = "阶段：接收 manifest 控制帧"
+                    if (controlMetaReady) {
+                        controlInfoText.text = "控制帧信息：${controlFileName} | ${controlFileSize} 字节 | ${controlSymbolCount} 分片"
+                    }
                 }
             }
             "manifest_chunk" -> {
@@ -191,7 +217,8 @@ class MainActivity : ComponentActivity() {
                     if (manifestSha256.isNullOrBlank() || manifestSha256 == sha) {
                         manifestText = text
                         runOnUiThread {
-                            statusText.text = "阶段：manifest 已就绪，继续扫码数据分片"
+                            statusText.text = "阶段：manifest 已就绪，可继续自动扫码"
+                            finalizeButton.isEnabled = true
                         }
                     }
                 }
@@ -215,6 +242,10 @@ class MainActivity : ComponentActivity() {
 
     private fun finalizeAndUpload() {
         stopScan()
+        if (!controlMetaReady || manifestText.isNullOrBlank()) {
+            statusText.text = "控制帧未完成，请先扫控制帧"
+            return
+        }
         rebuildMissing()
         missingHint.text = "缺失分片：${missingSymbolIds.size}"
         if (missingSymbolIds.isNotEmpty()) {
@@ -227,6 +258,7 @@ class MainActivity : ComponentActivity() {
             statusText.text = "请填写 Windows 地址"
             return
         }
+        prefs.edit().putString("windows_addr", windowsAddr).apply()
 
         statusText.text = "阶段：校验通过，开始上传"
         uploadedCount = 0
@@ -328,6 +360,9 @@ class MainActivity : ComponentActivity() {
             report.put("missing_symbols", missingSymbolIds.size)
             report.put("uploaded_symbols", uploadedCount)
             report.put("manifest_ready", !manifestText.isNullOrBlank())
+            report.put("control_file_name", controlFileName)
+            report.put("control_file_size", controlFileSize)
+            report.put("control_symbol_count", controlSymbolCount)
             File(outDir, "upload_report.json").writeText(report.toString(2))
 
             statusText.text = "已导出：${outDir.absolutePath}"

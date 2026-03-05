@@ -6,6 +6,7 @@ const redundancyInput = document.getElementById('redundancyInput');
 const prepareBtn = document.getElementById('prepareBtn');
 const exportMissingBtn = document.getElementById('exportMissingBtn');
 const startBtn = document.getElementById('startBtn');
+const startDataBtn = document.getElementById('startDataBtn');
 const repairBtn = document.getElementById('repairBtn');
 const stopBtn = document.getElementById('stopBtn');
 const missingInput = document.getElementById('missingInput');
@@ -22,6 +23,8 @@ let frameIndex = 0;
 let currentTransferId = '';
 let symbolIndex = new Map();
 let manifestObject = null;
+let manifestFrames = [];
+let dataFrames = [];
 
 function log(msg) {
   logEl.textContent += `${msg}\n`;
@@ -130,6 +133,9 @@ function buildManifestFrames(manifest, transferId, frameSeqStart, chunkSize = 90
     frame_seq: frameSeq,
     chunk_total: chunks.length,
     manifest_sha256: manifest.manifest_sha256,
+    payload_name: manifest.payload_name,
+    payload_size: manifest.payload_size,
+    payload_symbol_count: manifest.payload_symbol_count,
     ts: Date.now(),
   }));
   frameSeq += 1;
@@ -175,6 +181,8 @@ async function prepareFrames() {
   const redundancy = Math.max(0, Number(redundancyInput.value || 0.2));
   currentTransferId = randomTransferId();
   allFrames = [];
+  manifestFrames = [];
+  dataFrames = [];
   symbolIndex = new Map();
 
   let frameSeq = 0;
@@ -290,6 +298,9 @@ async function prepareFrames() {
     protocol: 'easytransfer/1',
     transfer_id: currentTransferId,
     created_ts: Date.now(),
+    payload_name: manifestFiles.length === 1 ? manifestFiles[0].path : 'bundle.bin',
+    payload_size: manifestFiles.reduce((acc, item) => acc + (item.size || 0), 0),
+    payload_symbol_count: totalSymbols,
     files: manifestFiles,
     totals: {
       file_count: manifestFiles.length,
@@ -300,7 +311,8 @@ async function prepareFrames() {
   manifestObject = { ...manifestBase, manifest_sha256: manifestSha };
 
   const mf = buildManifestFrames(manifestObject, currentTransferId, 0);
-  allFrames = [...mf.frames, ...allFrames.map((txt, idx) => {
+  manifestFrames = [...mf.frames];
+  dataFrames = [...allFrames.map((txt, idx) => {
     try {
       const o = JSON.parse(txt);
       o.frame_seq = idx + mf.frames.length;
@@ -309,8 +321,10 @@ async function prepareFrames() {
       return txt;
     }
   })];
+  allFrames = [...manifestFrames, ...dataFrames];
 
   startBtn.disabled = false;
+  startDataBtn.disabled = false;
   repairBtn.disabled = false;
   stats.textContent = `传输ID: ${currentTransferId} | 分片总数: ${totalSymbols} | 总帧数: ${allFrames.length}`;
   log(`已生成完成，manifest控制帧=${mf.frames.length}，传输ID=${currentTransferId}`);
@@ -328,7 +342,13 @@ function startPlayback(mode) {
   if (!allFrames.length) return;
   if (timer) clearInterval(timer);
 
-  if (mode === 'missing') {
+  if (mode === 'manifest') {
+    playFrames = manifestFrames;
+    log(`开始播放控制帧，帧数=${playFrames.length}`);
+  } else if (mode === 'data') {
+    playFrames = dataFrames;
+    log(`开始播放数据帧，帧数=${playFrames.length}`);
+  } else if (mode === 'missing') {
     let missingIds = [];
     try {
       const parsed = JSON.parse(missingInput.value || '{}');
@@ -352,6 +372,7 @@ function startPlayback(mode) {
   const interval = Math.floor(1000 / fps);
   frameIndex = 0;
   startBtn.disabled = true;
+  startDataBtn.disabled = true;
   repairBtn.disabled = true;
   stopBtn.disabled = false;
 
@@ -366,6 +387,7 @@ function stopPlayback() {
   if (timer) clearInterval(timer);
   timer = null;
   startBtn.disabled = false;
+  startDataBtn.disabled = false;
   repairBtn.disabled = false;
   stopBtn.disabled = true;
   log('已停止播放');
@@ -374,6 +396,7 @@ function stopPlayback() {
 prepareBtn.addEventListener('click', () => {
   prepareFrames().catch((err) => log(`生成失败：${err.message || err}`));
 });
-startBtn.addEventListener('click', () => startPlayback('all'));
+startBtn.addEventListener('click', () => startPlayback('manifest'));
+startDataBtn.addEventListener('click', () => startPlayback('data'));
 repairBtn.addEventListener('click', () => startPlayback('missing'));
 stopBtn.addEventListener('click', stopPlayback);

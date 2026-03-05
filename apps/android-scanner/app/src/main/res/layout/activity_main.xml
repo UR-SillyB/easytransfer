@@ -40,6 +40,20 @@
         android:text="阶段：等待扫码..." />
 
     <TextView
+        android:id="@+id/controlInfoText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:text="控制帧信息：未解析" />
+
+    <TextView
+        android:id="@+id/frameInfoText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="当前帧：--" />
+
+    <TextView
         android:id="@+id/missingHint"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -65,7 +79,8 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:text="校验缺失并上传到 Windows" />
+        android:text="校验缺失并上传到 Windows"
+        android:enabled="false" />
 
     <Button
         android:id="@+id/exportButton"
