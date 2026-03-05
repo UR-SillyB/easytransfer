@@ -62,6 +62,7 @@ struct ServerReport {
 struct ReceiverServerState {
     running: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    manifest_path: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for ReceiverServerState {
@@ -69,6 +70,7 @@ impl Default for ReceiverServerState {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             worker: None,
+            manifest_path: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -144,14 +146,33 @@ fn start_receiver_server(
         fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
     }
 
+    let manifest_auto = if let Some(parent) = path.parent() {
+        parent.join("manifest.auto.json")
+    } else {
+        PathBuf::from("manifest.auto.json")
+    };
+    {
+        let mut mg = guard
+            .manifest_path
+            .lock()
+            .map_err(|_| "manifest路径锁失败".to_string())?;
+        *mg = Some(manifest_auto.to_string_lossy().to_string());
+    }
+
     let running = guard.running.clone();
+    let manifest_path_arc = guard.manifest_path.clone();
     running.store(true, Ordering::SeqCst);
 
     let worker = thread::spawn(move || {
         while running.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let _ = handle_windows_client(&mut stream, &path);
+                    let mp = manifest_path_arc
+                        .lock()
+                        .ok()
+                        .and_then(|x| x.clone())
+                        .unwrap_or_default();
+                    let _ = handle_windows_client(&mut stream, &path, Path::new(&mp));
                 }
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::WouldBlock {
@@ -199,7 +220,17 @@ fn stop_receiver_server(
 
 #[tauri::command]
 fn reconstruct(received_path: String, manifest_path: String, output_dir: String) -> Result<Report, String> {
-    let manifest_str = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+    let mpath = if manifest_path.trim().is_empty() {
+        let p = PathBuf::from(&received_path);
+        if let Some(parent) = p.parent() {
+            parent.join("manifest.auto.json")
+        } else {
+            PathBuf::from("manifest.auto.json")
+        }
+    } else {
+        PathBuf::from(manifest_path)
+    };
+    let manifest_str = fs::read_to_string(&mpath).map_err(|e| e.to_string())?;
     let manifest: Manifest = serde_json::from_str(&manifest_str).map_err(|e| e.to_string())?;
 
     let symbol_map = load_symbol_map(&received_path)?;
@@ -306,12 +337,24 @@ fn load_symbol_map(path: &str) -> Result<HashMap<String, Vec<u8>>, String> {
     Ok(symbol_map)
 }
 
-fn handle_windows_client(stream: &mut TcpStream, received_path: &Path) -> Result<(), String> {
+fn handle_windows_client(stream: &mut TcpStream, received_path: &Path, manifest_auto_path: &Path) -> Result<(), String> {
     let mut req = Vec::new();
     stream
         .read_to_end(&mut req)
         .map_err(|e| format!("读取请求失败: {}", e))?;
     let req_text = String::from_utf8_lossy(&req).to_string();
+    if req_text.starts_with("POST /upload-manifest") {
+        let parts: Vec<&str> = req_text.split("\r\n\r\n").collect();
+        if parts.len() < 2 {
+            write_http(stream, 400, "Bad Request", "{\"ok\":false,\"error\":\"body\"}")?;
+            return Ok(());
+        }
+        fs::write(manifest_auto_path, parts[1]).map_err(|e| format!("写manifest失败: {}", e))?;
+        write_http(stream, 200, "OK", "{\"ok\":true,\"saved\":\"manifest\"}")?;
+        let _ = stream.shutdown(Shutdown::Both);
+        return Ok(());
+    }
+
     if !req_text.starts_with("POST /upload-symbol") {
         write_http(stream, 404, "Not Found", "{\"ok\":false,\"error\":\"path\"}")?;
         return Ok(());

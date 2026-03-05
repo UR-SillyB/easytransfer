@@ -21,6 +21,7 @@ let timer = null;
 let frameIndex = 0;
 let currentTransferId = '';
 let symbolIndex = new Map();
+let manifestObject = null;
 
 function log(msg) {
   logEl.textContent += `${msg}\n`;
@@ -49,9 +50,7 @@ async function compressBestForSmallFile(raw) {
         writer.write(raw);
         writer.close();
         const payload = await new Response(cs.readable).arrayBuffer();
-        if (payload.byteLength < best.payload.byteLength) {
-          best = { codec, payload };
-        }
+        if (payload.byteLength < best.payload.byteLength) best = { codec, payload };
       } catch (_e) {
       }
     }
@@ -61,12 +60,10 @@ async function compressBestForSmallFile(raw) {
 }
 
 function iterChunks(u8, size) {
-  const arr = [];
-  for (let i = 0; i < u8.length; i += size) {
-    arr.push(u8.slice(i, i + size));
-  }
-  if (!arr.length) arr.push(new Uint8Array());
-  return arr;
+  const out = [];
+  for (let i = 0; i < u8.length; i += size) out.push(u8.slice(i, i + size));
+  if (!out.length) out.push(new Uint8Array());
+  return out;
 }
 
 function xorSymbols(symbols, indices) {
@@ -74,9 +71,7 @@ function xorSymbols(symbols, indices) {
   const out = new Uint8Array(maxLen);
   for (const idx of indices) {
     const src = symbols[idx];
-    for (let i = 0; i < maxLen; i += 1) {
-      out[i] ^= (i < src.length ? src[i] : 0);
-    }
+    for (let i = 0; i < maxLen; i += 1) out[i] ^= (i < src.length ? src[i] : 0);
   }
   return out;
 }
@@ -121,6 +116,53 @@ function randomTransferId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
 }
 
+function buildManifestFrames(manifest, transferId, frameSeqStart, chunkSize = 900) {
+  const text = JSON.stringify(manifest);
+  const bytes = new TextEncoder().encode(text);
+  const chunks = iterChunks(bytes, chunkSize);
+  const frames = [];
+  let frameSeq = frameSeqStart;
+
+  frames.push(encodeFrameText({
+    v: 1,
+    kind: 'manifest_start',
+    transfer_id: transferId,
+    frame_seq: frameSeq,
+    chunk_total: chunks.length,
+    manifest_sha256: manifest.manifest_sha256,
+    ts: Date.now(),
+  }));
+  frameSeq += 1;
+
+  for (let i = 0; i < chunks.length; i += 1) {
+    frames.push(encodeFrameText({
+      v: 1,
+      kind: 'manifest_chunk',
+      transfer_id: transferId,
+      frame_seq: frameSeq,
+      chunk_index: i,
+      chunk_total: chunks.length,
+      payload_b64: btoa(String.fromCharCode(...chunks[i])),
+      payload_crc32: crc32(chunks[i]),
+      ts: Date.now(),
+    }));
+    frameSeq += 1;
+  }
+
+  frames.push(encodeFrameText({
+    v: 1,
+    kind: 'manifest_end',
+    transfer_id: transferId,
+    frame_seq: frameSeq,
+    chunk_total: chunks.length,
+    manifest_sha256: manifest.manifest_sha256,
+    ts: Date.now(),
+  }));
+  frameSeq += 1;
+
+  return { frames, nextSeq: frameSeq };
+}
+
 async function prepareFrames() {
   const files = [...fileInput.files];
   if (!files.length) {
@@ -138,6 +180,7 @@ async function prepareFrames() {
   let frameSeq = 0;
   let totalSymbols = 0;
   const indexRows = [];
+  const manifestFiles = [];
 
   for (let fileId = 0; fileId < files.length; fileId += 1) {
     const file = files[fileId];
@@ -147,6 +190,8 @@ async function prepareFrames() {
     const compressed = await compressBestForSmallFile(rawBuf);
     const compU8 = new Uint8Array(compressed.payload);
     const blocks = iterChunks(compU8, blockSize);
+
+    const sourceSymbolIds = [];
 
     allFrames.push(encodeFrameText({
       v: 1,
@@ -191,6 +236,7 @@ async function prepareFrames() {
         const text = encodeFrameText(rec);
         allFrames.push(text);
         symbolIndex.set(sid, text);
+        sourceSymbolIds.push(sid);
         indexRows.push(sid);
         frameSeq += 1;
         totalSymbols += 1;
@@ -228,12 +274,46 @@ async function prepareFrames() {
         frameSeq += 1;
       }
     }
+
+    manifestFiles.push({
+      id: fileId,
+      path: file.name,
+      size: file.size,
+      sha256: fileHash,
+      compression: compressed.codec,
+      source_symbol_ids: sourceSymbolIds,
+    });
   }
+
+  const manifestBase = {
+    version: 1,
+    protocol: 'easytransfer/1',
+    transfer_id: currentTransferId,
+    created_ts: Date.now(),
+    files: manifestFiles,
+    totals: {
+      file_count: manifestFiles.length,
+      symbol_count: totalSymbols,
+    },
+  };
+  const manifestSha = await sha256Hex(new TextEncoder().encode(JSON.stringify(manifestBase)).buffer);
+  manifestObject = { ...manifestBase, manifest_sha256: manifestSha };
+
+  const mf = buildManifestFrames(manifestObject, currentTransferId, 0);
+  allFrames = [...mf.frames, ...allFrames.map((txt, idx) => {
+    try {
+      const o = JSON.parse(txt);
+      o.frame_seq = idx + mf.frames.length;
+      return JSON.stringify(o);
+    } catch (_e) {
+      return txt;
+    }
+  })];
 
   startBtn.disabled = false;
   repairBtn.disabled = false;
   stats.textContent = `传输ID: ${currentTransferId} | 分片总数: ${totalSymbols} | 总帧数: ${allFrames.length}`;
-  log(`已生成完成，传输ID=${currentTransferId}`);
+  log(`已生成完成，manifest控制帧=${mf.frames.length}，传输ID=${currentTransferId}`);
 
   const indexBlob = new Blob([JSON.stringify({ transfer_id: currentTransferId, symbol_ids: indexRows }, null, 2)], { type: 'application/json' });
   exportMissingBtn.onclick = () => {

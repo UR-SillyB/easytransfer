@@ -90,8 +90,8 @@ runBtn.addEventListener('click', async () => {
   const receivedPath = document.getElementById('receivedPath').value.trim();
   const manifestPath = document.getElementById('manifestPath').value.trim();
   const outputDir = document.getElementById('outputDir').value.trim();
-  if (!receivedPath || !manifestPath || !outputDir) {
-    log('请填写重组所需路径');
+  if (!receivedPath || !outputDir) {
+    log('请填写接收文件路径与输出目录');
     return;
   }
   try {

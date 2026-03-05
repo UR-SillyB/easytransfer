@@ -49,6 +49,10 @@ class MainActivity : ComponentActivity() {
     private val allSeenByBlock = linkedMapOf<String, MutableSet<Int>>()
     private val missingSymbolIds = linkedSetOf<String>()
     private var uploadedCount = 0
+    private var manifestText: String? = null
+    private val manifestChunks = linkedMapOf<Int, ByteArray>()
+    private var manifestChunkTotal = 0
+    private var manifestSha256: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -114,7 +118,14 @@ class MainActivity : ComponentActivity() {
         if (!isScanning) return
         try {
             val obj = JSONObject(payload)
-            if (obj.optString("kind") != "symbol") return
+            val kind = obj.optString("kind")
+
+            if (kind.startsWith("manifest_")) {
+                processManifestFrame(obj)
+                return
+            }
+
+            if (kind != "symbol") return
 
             val sid = obj.optString("stable_symbol_id")
             if (sid.isBlank()) return
@@ -138,6 +149,53 @@ class MainActivity : ComponentActivity() {
                 statusText.text = "阶段：扫码采集中，已收 ${symbolMap.size} 分片"
             }
         } catch (_: Exception) {
+        }
+    }
+
+    private fun processManifestFrame(obj: JSONObject) {
+        val kind = obj.optString("kind")
+        when (kind) {
+            "manifest_start" -> {
+                manifestChunks.clear()
+                manifestChunkTotal = obj.optInt("chunk_total", 0)
+                manifestSha256 = obj.optString("manifest_sha256")
+                runOnUiThread {
+                    statusText.text = "阶段：接收 manifest 控制帧"
+                }
+            }
+            "manifest_chunk" -> {
+                val idx = obj.optInt("chunk_index", -1)
+                val b64 = obj.optString("payload_b64")
+                if (idx >= 0 && b64.isNotBlank()) {
+                    try {
+                        val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                        val crc = obj.optLong("payload_crc32", -1).toInt()
+                        if (crc32(bytes) == crc) {
+                            manifestChunks[idx] = bytes
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+            "manifest_end" -> {
+                if (manifestChunkTotal > 0 && manifestChunks.size == manifestChunkTotal) {
+                    val all = ByteArray(manifestChunks.values.sumOf { it.size })
+                    var off = 0
+                    for (i in 0 until manifestChunkTotal) {
+                        val part = manifestChunks[i] ?: return
+                        System.arraycopy(part, 0, all, off, part.size)
+                        off += part.size
+                    }
+                    val text = String(all, Charsets.UTF_8)
+                    val sha = sha256Hex(all)
+                    if (manifestSha256.isNullOrBlank() || manifestSha256 == sha) {
+                        manifestText = text
+                        runOnUiThread {
+                            statusText.text = "阶段：manifest 已就绪，继续扫码数据分片"
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -173,6 +231,10 @@ class MainActivity : ComponentActivity() {
         statusText.text = "阶段：校验通过，开始上传"
         uploadedCount = 0
         ioExecutor.execute {
+            val m = manifestText
+            if (!m.isNullOrBlank()) {
+                uploadManifestToWindows(windowsAddr, m)
+            }
             val values = symbolMap.values.toList()
             for (obj in values) {
                 val rec = JSONObject()
@@ -189,6 +251,28 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 statusText.text = "阶段：上传完成，成功 $uploadedCount / ${symbolMap.size}"
             }
+        }
+    }
+
+    private fun uploadManifestToWindows(addr: String, payload: String): Boolean {
+        return try {
+            val endpoint = if (addr.startsWith("http://") || addr.startsWith("https://")) {
+                "$addr/upload-manifest"
+            } else {
+                "http://$addr/upload-manifest"
+            }
+            val conn = (URL(endpoint).openConnection() as HttpURLConnection)
+            conn.requestMethod = "POST"
+            conn.connectTimeout = 3000
+            conn.readTimeout = 5000
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            val bytes = payload.toByteArray(Charsets.UTF_8)
+            conn.setRequestProperty("Content-Length", bytes.size.toString())
+            conn.outputStream.use { out: OutputStream -> out.write(bytes) }
+            conn.responseCode in 200..299
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -243,6 +327,7 @@ class MainActivity : ComponentActivity() {
             report.put("scanned_symbols", symbolMap.size)
             report.put("missing_symbols", missingSymbolIds.size)
             report.put("uploaded_symbols", uploadedCount)
+            report.put("manifest_ready", !manifestText.isNullOrBlank())
             File(outDir, "upload_report.json").writeText(report.toString(2))
 
             statusText.text = "已导出：${outDir.absolutePath}"
@@ -250,6 +335,20 @@ class MainActivity : ComponentActivity() {
             statusText.text = "导出失败：${e.message}"
         }
     }
+}
+
+private fun sha256Hex(bytes: ByteArray): String {
+    val md = java.security.MessageDigest.getInstance("SHA-256")
+    val out = md.digest(bytes)
+    val sb = StringBuilder(out.size * 2)
+    for (b in out) sb.append(String.format("%02x", b))
+    return sb.toString()
+}
+
+private fun crc32(bytes: ByteArray): Int {
+    val crc = java.util.zip.CRC32()
+    crc.update(bytes)
+    return crc.value.toInt()
 }
 
 private class FrameAnalyzer(
