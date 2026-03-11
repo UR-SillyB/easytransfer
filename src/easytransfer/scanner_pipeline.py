@@ -11,6 +11,8 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import cast
 
+from .fec_recovery import estimate_additional_repair_needed
+
 
 class ScannerInputError(Exception):
     pass
@@ -69,21 +71,27 @@ def scan_frames(
     truth_k: dict[str, int] = {}
     truth_meta: dict[str, dict[str, object]] = {}
     truth_source_ids: dict[str, set[str]] = defaultdict(set)
+    truth_repair_equations: dict[str, dict[str, tuple[str, ...]]] = defaultdict(dict)
     with frames_p.open("r", encoding="utf-8") as fin_truth:
         for _ln, rec in _iter_jsonl(fin_truth, source=str(frames_p)):
             if not _is_sender_symbol_record(rec):
                 continue
             bkey = _block_key(rec)
-            is_repair = bool(rec.get("redundant", False))
+            sid = _symbol_id_str(rec)
+            is_repair = _is_repair_symbol(rec)
             if not is_repair:
                 truth_k[bkey] = truth_k.get(bkey, 0) + 1
-                sid = _symbol_id_str(rec)
                 truth_source_ids[bkey].add(sid)
+            else:
+                xor_of = _repair_source_ids(rec)
+                if xor_of:
+                    truth_repair_equations[bkey][sid] = xor_of
             if bkey not in truth_meta:
+                block_val = _frame_int(rec, "block", "block_id")
                 truth_meta[bkey] = {
                     "file_id": rec.get("file_id"),
                     "path": rec.get("path"),
-                    "block": rec.get("block"),
+                    "block": block_val,
                     "block_len": rec.get("block_len"),
                 }
 
@@ -91,6 +99,7 @@ def scan_frames(
     block_repair_counts: dict[str, int] = defaultdict(int)
     block_data_counts: dict[str, int] = defaultdict(int)
     block_source_ids: dict[str, set[str]] = defaultdict(set)
+    block_repair_ids: dict[str, set[str]] = defaultdict(set)
 
     burst_remaining = 0
 
@@ -138,9 +147,10 @@ def scan_frames(
                 continue
             block_symbol_ids[bkey].add(sid)
 
-            is_repair = bool(frame.get("redundant", False))
+            is_repair = _is_repair_symbol(frame)
             if is_repair:
                 block_repair_counts[bkey] += 1
+                block_repair_ids[bkey].add(sid)
             else:
                 block_data_counts[bkey] += 1
                 block_source_ids[bkey].add(sid)
@@ -162,16 +172,27 @@ def scan_frames(
                     stats["symbols_dropped_decode"] += 1
                     continue
 
+            block_val = _frame_int(frame, "block", "block_id")
+            symbol_val = _frame_int(frame, "symbol", "symbol_index")
+            frame_seq_val = _frame_int(frame, "frame", "frame_seq")
+
             out_rec: dict[str, object] = {
                 "symbol_id": sid,
                 "data_b64": payload_b64,
+                "payload_b64": payload_b64,
                 "crc32": zlib.crc32(payload) & 0xFFFFFFFF,
+                "payload_crc32": zlib.crc32(payload) & 0xFFFFFFFF,
                 "file_id": frame.get("file_id"),
                 "path": frame.get("path"),
-                "block": frame.get("block"),
-                "symbol": frame.get("symbol"),
+                "block": block_val,
+                "block_id": block_val,
+                "symbol": symbol_val,
+                "symbol_index": symbol_val,
                 "redundant": bool(is_repair),
+                "is_repair": bool(is_repair),
                 "frame": frame.get("frame", frame_id),
+                "frame_seq": frame_seq_val if frame_seq_val is not None else frame_id,
+                "transfer_id": frame.get("transfer_id"),
             }
             _ = fout.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
             stats["symbols_emitted"] += 1
@@ -187,7 +208,9 @@ def scan_frames(
         block_data_counts=block_data_counts,
         block_meta=truth_meta,
         block_source_ids=block_source_ids,
+        block_repair_ids=block_repair_ids,
         truth_source_ids=truth_source_ids,
+        truth_repair_equations=truth_repair_equations,
     )
 
     _ = feedback_path.write_text(json.dumps(feedback, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -221,7 +244,7 @@ def _iter_jsonl(fin: Iterable[str], *, source: str) -> Iterator[tuple[int, dict[
 
 
 def _frame_id(frame: dict[str, object], *, fallback: int) -> int:
-    for k in ("frame_id", "frame", "seq", "index", "i"):
+    for k in ("frame_id", "frame", "frame_seq", "seq", "index", "i"):
         v = frame.get(k)
         if isinstance(v, int):
             return v
@@ -295,11 +318,20 @@ def _build_feedback(
     block_data_counts: dict[str, int],
     block_meta: dict[str, dict[str, object]],
     block_source_ids: dict[str, set[str]],
+    block_repair_ids: dict[str, set[str]],
     truth_source_ids: dict[str, set[str]],
+    truth_repair_equations: dict[str, dict[str, tuple[str, ...]]],
 ) -> dict[str, object]:
     blocks: dict[str, object] = {}
     need_list: list[dict[str, object]] = []
     total_need = 0
+
+    additional_need = estimate_additional_repair_needed(
+        expected_source_ids=truth_source_ids,
+        received_source_ids=block_source_ids,
+        received_repair_ids=block_repair_ids,
+        repair_equations=truth_repair_equations,
+    )
 
     all_blocks = set(block_k.keys()) | set(block_symbol_ids.keys())
     for block_id in sorted(all_blocks, key=lambda x: (len(x), x)):
@@ -309,7 +341,7 @@ def _build_feedback(
         missing_source_ids: list[str] | None = None
         missing_source_count: int | None = None
         if isinstance(k, int) and k > 0:
-            need = max(0, k - received)
+            need = int(additional_need.get(block_id, 0))
             expected_sources = truth_source_ids.get(block_id)
             got_sources = block_source_ids.get(block_id)
             if expected_sources is not None and got_sources is not None:
@@ -324,6 +356,7 @@ def _build_feedback(
             "need_repair": need,
             "missing_source_count": missing_source_count,
             "missing_source_symbol_ids": missing_source_ids,
+            "received_repair_equations": len(block_repair_ids.get(block_id, set())),
         }
         meta = block_meta.get(block_id)
         if meta:
@@ -355,7 +388,7 @@ def _build_feedback(
         "recommendation": {
             "need_blocks": need_list,
             "total_need_repair": total_need,
-            "note": "补传建议：对 need_blocks 中的每个 block 补传 need_repair 个任意新修复符号（repair symbols）。",
+            "note": "补传建议基于可解方程数估算。对 need_blocks 中每个 block 至少补传 need_repair 个新修复符号。",
         },
     }
 
@@ -382,26 +415,75 @@ def _is_sender_symbol_record(rec: dict[str, object]) -> bool:
         return False
     if not isinstance(rec.get("payload_b64"), str):
         return False
-    if not isinstance(rec.get("block"), int):
+    if _frame_int(rec, "block", "block_id") is None:
         return False
-    if not isinstance(rec.get("symbol"), int):
+    if _frame_int(rec, "symbol", "symbol_index") is None:
         return False
     return True
 
 
 def _block_key(rec: dict[str, object]) -> str:
-    file_id = rec.get("file_id")
-    block = rec.get("block")
-    if isinstance(file_id, int) and isinstance(block, int):
+    file_id = _frame_int(rec, "file_id")
+    block = _frame_int(rec, "block", "block_id")
+    if file_id is not None and block is not None:
         return f"{file_id}:{block}"
-    return f"{file_id}:{block}"
+    return f"{rec.get('file_id')}:{rec.get('block', rec.get('block_id'))}"
 
 
 def _symbol_id_str(rec: dict[str, object]) -> str:
     sid = rec.get("symbol_id")
     if isinstance(sid, str) and sid:
         return sid
-    file_id = rec.get("file_id")
-    block = rec.get("block")
-    symbol = rec.get("symbol")
-    return f"f{file_id}:b{block}:s{symbol}"
+    file_id = _frame_int(rec, "file_id")
+    block = _frame_int(rec, "block", "block_id")
+    symbol = _frame_int(rec, "symbol", "symbol_index")
+    transfer_id = rec.get("transfer_id")
+    prefix = f"{transfer_id}:" if isinstance(transfer_id, str) and transfer_id else ""
+    if file_id is None or block is None or symbol is None:
+        return prefix + "unknown"
+    if _is_repair_symbol(rec):
+        k = _frame_int(rec, "k", "source_symbol_total")
+        ridx = symbol if k is None else max(0, symbol - k)
+        return f"{prefix}f{file_id}:b{block}:r{ridx}"
+    return f"{prefix}f{file_id}:b{block}:s{symbol}"
+
+
+def _frame_int(rec: dict[str, object], *keys: str) -> int | None:
+    for k in keys:
+        v = rec.get(k)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            if s and (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+                return int(s)
+    return None
+
+
+def _is_repair_symbol(rec: dict[str, object]) -> bool:
+    v = rec.get("redundant")
+    if isinstance(v, bool):
+        return v
+    v2 = rec.get("is_repair")
+    if isinstance(v2, bool):
+        return v2
+    return False
+
+
+def _repair_source_ids(rec: dict[str, object]) -> tuple[str, ...]:
+    for key in ("xor_of", "repair_of"):
+        val = rec.get(key)
+        if not isinstance(val, list):
+            continue
+        out: list[str] = []
+        bad = False
+        for x in cast(list[object], val):
+            if not isinstance(x, str) or not x:
+                bad = True
+                break
+            out.append(x)
+        if not bad and out:
+            return tuple(out)
+    return tuple()

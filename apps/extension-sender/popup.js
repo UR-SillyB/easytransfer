@@ -198,29 +198,46 @@ async function prepareFrames() {
       const symbols = iterChunks(blocks[blockId], symbolSize);
       const symbolTotal = symbols.length;
       const repairCount = Math.ceil(symbolTotal * redundancy);
+      const blockLen = blocks[blockId].length;
 
       for (let symbolId = 0; symbolId < symbolTotal; symbolId += 1) {
         const sid = makeSymbolId(currentTransferId, fileId, blockId, symbolId);
         const payload = symbols[symbolId];
+        const payloadB64 = btoa(String.fromCharCode(...payload));
+        const payloadCrc32 = crc32(payload);
         const rec = {
           v: 1,
           kind: 'symbol',
           transfer_id: currentTransferId,
+          stream_id: currentTransferId,
           frame_seq: frameSeq,
+          frame: frameSeq,
           file_id: fileId,
+          path: file.name,
           block_id: blockId,
+          block: blockId,
+          block_len: blockLen,
           block_total: blocks.length,
           symbol_index: symbolId,
+          symbol: symbolId,
           source_symbol_total: symbolTotal,
+          k: symbolTotal,
           is_repair: false,
+          redundant: false,
           symbol_id: sid,
-          payload_b64: btoa(String.fromCharCode(...payload)),
+          payload_b64: payloadB64,
+          data_b64: payloadB64,
           payload_sha256: await sha256Hex(payload.buffer),
-          payload_crc32: crc32(payload),
+          payload_crc32: payloadCrc32,
+          crc32: payloadCrc32,
           payload_file_name: file.name,
+          file_name: file.name,
           payload_file_size: file.size,
+          file_size: file.size,
           payload_file_sha256: fileHash,
+          file_sha256: fileHash,
           payload_compression: compressed.codec,
+          compression: compressed.codec,
           ts: Date.now(),
         };
         const text = encodeFrameText(rec);
@@ -240,26 +257,44 @@ async function prepareFrames() {
         const uniq = [...new Set(indices)].sort((a, b) => a - b);
         const parity = xorSymbols(symbols, uniq);
         const sid = `${currentTransferId}:f${fileId}:b${blockId}:r${r}`;
+        const payloadB64 = btoa(String.fromCharCode(...parity));
+        const payloadCrc32 = crc32(parity);
+        const xorOf = uniq.map((x) => makeSymbolId(currentTransferId, fileId, blockId, x));
         const rec = {
           v: 1,
           kind: 'symbol',
           transfer_id: currentTransferId,
+          stream_id: currentTransferId,
           frame_seq: frameSeq,
+          frame: frameSeq,
           file_id: fileId,
+          path: file.name,
           block_id: blockId,
+          block: blockId,
+          block_len: blockLen,
           block_total: blocks.length,
           symbol_index: symbolTotal + r,
+          symbol: symbolTotal + r,
           source_symbol_total: symbolTotal,
+          k: symbolTotal,
           is_repair: true,
+          redundant: true,
           symbol_id: sid,
-          repair_of: uniq.map((x) => makeSymbolId(currentTransferId, fileId, blockId, x)),
-          payload_b64: btoa(String.fromCharCode(...parity)),
+          repair_of: xorOf,
+          xor_of: xorOf,
+          payload_b64: payloadB64,
+          data_b64: payloadB64,
           payload_sha256: await sha256Hex(parity.buffer),
-          payload_crc32: crc32(parity),
+          payload_crc32: payloadCrc32,
+          crc32: payloadCrc32,
           payload_file_name: file.name,
+          file_name: file.name,
           payload_file_size: file.size,
+          file_size: file.size,
           payload_file_sha256: fileHash,
+          file_sha256: fileHash,
           payload_compression: compressed.codec,
+          compression: compressed.codec,
           ts: Date.now(),
         };
         const text = encodeFrameText(rec);

@@ -7,6 +7,7 @@ from .compression_layer import (
     DecompressionError,
     DecompressionLimits,
     build_default_registry,
+    build_transfer_registry,
     compress_bytes,
     decompress_bytes,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "DecompressionError",
     "DecompressionLimits",
     "build_default_registry",
+    "build_transfer_registry",
     "compress_bytes",
     "decompress_bytes",
     "ManifestFileEntry",

@@ -142,7 +142,8 @@ class MainActivity : ComponentActivity() {
 
             if (kind != "symbol") return
             runOnUiThread {
-                frameInfoText.text = "当前帧：#${obj.optInt("frame_seq", -1)} 文件${obj.optInt("file_id", -1)} 块${obj.optInt("block_id", -1)} 分片${obj.optInt("symbol_index", -1)}"
+                frameInfoText.text =
+                    "当前帧：#${readInt(obj, "frame_seq", "frame", -1)} 文件${readInt(obj, "file_id", null, -1)} 块${readInt(obj, "block", "block_id", -1)} 分片${readInt(obj, "symbol", "symbol_index", -1)}"
             }
 
             val sid = obj.optString("symbol_id")
@@ -156,8 +157,11 @@ class MainActivity : ComponentActivity() {
             }
 
             if (symbolMap.containsKey(sid)) {
-                val oldPayload = symbolMap[sid]?.optString("payload_b64")
-                val newPayload = obj.optString("payload_b64")
+                val oldPayload = symbolMap[sid]?.let { sym ->
+                    val p = sym.optString("payload_b64")
+                    if (p.isNotBlank()) p else sym.optString("data_b64")
+                }
+                val newPayload = obj.optString("payload_b64").ifBlank { obj.optString("data_b64") }
                 if (!oldPayload.isNullOrBlank() && oldPayload != newPayload) {
                     uploadConflictIds.add(sid)
                 }
@@ -165,11 +169,14 @@ class MainActivity : ComponentActivity() {
             }
             symbolMap[sid] = obj
 
-            val blockKey = "f${obj.optInt("file_id", -1)}:b${obj.optInt("block_id", -1)}"
-            val symbolId = obj.optInt("symbol_index", -1)
-            val expected = obj.optInt("source_symbol_total", -1)
+            val fileId = readInt(obj, "file_id", null, -1)
+            val blockId = readInt(obj, "block", "block_id", -1)
+            val symbolId = readInt(obj, "symbol", "symbol_index", -1)
+            val expected = readInt(obj, "source_symbol_total", "k", -1)
+            val isRepair = readBool(obj, "is_repair", "redundant", false)
+            val blockKey = "f${fileId}:b${blockId}"
             if (expected > 0) expectedByBlock[blockKey] = maxOf(expectedByBlock[blockKey] ?: 0, expected)
-            if (symbolId >= 0 && obj.optBoolean("is_repair", false).not()) {
+            if (symbolId >= 0 && !isRepair) {
                 allSeenByBlock.getOrPut(blockKey) { linkedSetOf() }.add(symbolId)
             }
 
@@ -273,12 +280,12 @@ class MainActivity : ComponentActivity() {
                 if (sid.isBlank()) continue
                 if (uploadedSymbolIds.contains(sid)) continue
 
-                val payloadB64 = obj.optString("payload_b64")
-                val payloadCrc = obj.optInt("payload_crc32", -1)
-                if (payloadB64.isNotBlank() && payloadCrc >= 0) {
+                val payloadB64 = obj.optString("payload_b64").ifBlank { obj.optString("data_b64") }
+                val payloadCrcCheck = obj.optInt("payload_crc32", obj.optInt("crc32", -1))
+                if (payloadB64.isNotBlank() && payloadCrcCheck >= 0) {
                     try {
                         val bytes = android.util.Base64.decode(payloadB64, android.util.Base64.DEFAULT)
-                        if (crc32(bytes) != payloadCrc) {
+                        if (crc32(bytes) != payloadCrcCheck) {
                             uploadConflictIds.add(sid)
                             continue
                         }
@@ -290,11 +297,27 @@ class MainActivity : ComponentActivity() {
 
                 val rec = JSONObject()
                 rec.put("symbol_id", sid)
-                rec.put("payload_b64", obj.optString("payload_b64"))
-                rec.put("file_id", obj.optInt("file_id", -1))
-                rec.put("block", obj.optInt("block_id", -1))
-                rec.put("symbol", obj.optInt("symbol_index", -1))
-                rec.put("redundant", obj.optBoolean("is_repair", false))
+                val payloadText = obj.optString("payload_b64").ifBlank { obj.optString("data_b64") }
+                val payloadCrcOut = obj.optInt("payload_crc32", obj.optInt("crc32", -1))
+                val blockId = readInt(obj, "block", "block_id", -1)
+                val symbolId = readInt(obj, "symbol", "symbol_index", -1)
+                val isRepair = readBool(obj, "is_repair", "redundant", false)
+                rec.put("payload_b64", payloadText)
+                rec.put("data_b64", payloadText)
+                if (payloadCrcOut >= 0) {
+                    rec.put("payload_crc32", payloadCrcOut)
+                    rec.put("crc32", payloadCrcOut)
+                }
+                rec.put("file_id", readInt(obj, "file_id", null, -1))
+                rec.put("block", blockId)
+                rec.put("block_id", blockId)
+                rec.put("symbol", symbolId)
+                rec.put("symbol_index", symbolId)
+                rec.put("redundant", isRepair)
+                rec.put("is_repair", isRepair)
+                rec.put("transfer_id", obj.optString("transfer_id"))
+                rec.put("frame", readInt(obj, "frame", "frame_seq", -1))
+                rec.put("frame_seq", readInt(obj, "frame_seq", "frame", -1))
 
                 var ok = false
                 var retry = 0
@@ -319,27 +342,67 @@ class MainActivity : ComponentActivity() {
         val values = synchronized(this) { symbolMap.values.toList() }
         val grouped = values.groupBy { it.optInt("file_id", -1) }
         val filesArr = JSONArray()
+        val sourcesArr = JSONArray()
+        val repairsArr = JSONArray()
         for ((fileId, list) in grouped) {
             if (fileId < 0) continue
-            val source = list.filter { !it.optBoolean("is_repair", false) }
-                .sortedWith(compareBy<JSONObject> { it.optInt("block_id", -1) }.thenBy { it.optInt("symbol_index", -1) })
+            val source = list.filter { !readBool(it, "is_repair", "redundant", false) }
+                .sortedWith(compareBy<JSONObject> { readInt(it, "block", "block_id", -1) }.thenBy { readInt(it, "symbol", "symbol_index", -1) })
             if (source.isEmpty()) continue
             val first = source.first()
             val obj = JSONObject()
-            obj.put("path", first.optString("payload_file_name", "file_${fileId}.bin"))
-            obj.put("size", first.optLong("payload_file_size", 0L))
-            obj.put("sha256", first.optString("payload_file_sha256", ""))
-            obj.put("compression", first.optString("payload_compression", "none"))
+            val path = first.optString("payload_file_name").ifBlank {
+                first.optString("file_name").ifBlank { first.optString("path", "file_${fileId}.bin") }
+            }
+            val size = when {
+                first.has("payload_file_size") -> first.optLong("payload_file_size", 0L)
+                first.has("file_size") -> first.optLong("file_size", 0L)
+                else -> first.optLong("size", 0L)
+            }
+            val sha = first.optString("payload_file_sha256").ifBlank { first.optString("file_sha256", "") }
+            val compression = first.optString("payload_compression").ifBlank { first.optString("compression", "none") }
+            obj.put("path", path)
+            obj.put("size", size)
+            obj.put("sha256", sha)
+            obj.put("compression", compression)
             val sidArr = JSONArray()
-            source.forEach { sidArr.put(it.optString("symbol_id")) }
+            source.forEachIndexed { idx, sym ->
+                val sid = sym.optString("symbol_id")
+                sidArr.put(sid)
+                val srcSpec = JSONObject()
+                srcSpec.put("symbol_id", sid)
+                srcSpec.put("file", path)
+                srcSpec.put("index", idx)
+                srcSpec.put("size", decodeB64Len(sym.optString("payload_b64").ifBlank { sym.optString("data_b64") }))
+                srcSpec.put("sha256", sym.optString("payload_sha256"))
+                sourcesArr.put(srcSpec)
+            }
             obj.put("source_symbol_ids", sidArr)
             filesArr.put(obj)
+
+            list.filter { readBool(it, "is_repair", "redundant", false) }.forEach { rep ->
+                val repSpec = JSONObject()
+                repSpec.put("symbol_id", rep.optString("symbol_id"))
+                repSpec.put("file", path)
+                repSpec.put("size", decodeB64Len(rep.optString("payload_b64").ifBlank { rep.optString("data_b64") }))
+                repSpec.put("sha256", rep.optString("payload_sha256"))
+                val xorArr = when {
+                    rep.has("xor_of") -> rep.optJSONArray("xor_of")
+                    rep.has("repair_of") -> rep.optJSONArray("repair_of")
+                    else -> JSONArray()
+                } ?: JSONArray()
+                repSpec.put("xor_of", xorArr)
+                repairsArr.put(repSpec)
+            }
         }
         val manifest = JSONObject()
         manifest.put("version", 1)
         manifest.put("protocol", "easytransfer/1")
+        manifest.put("stream_id", transferId ?: "")
         manifest.put("transfer_id", transferId ?: "")
         manifest.put("files", filesArr)
+        manifest.put("sources", sourcesArr)
+        manifest.put("repairs", repairsArr)
         return manifest.toString()
     }
 
@@ -396,11 +459,13 @@ class MainActivity : ComponentActivity() {
             val lines = symbolMap.values.map {
                 JSONObject().apply {
                     put("symbol_id", it.optString("symbol_id"))
-                    put("payload_b64", it.optString("payload_b64"))
-                    put("file_id", it.optInt("file_id", -1))
-                    put("block", it.optInt("block_id", -1))
-                    put("symbol", it.optInt("symbol_index", -1))
-                    put("redundant", it.optBoolean("is_repair", false))
+                    val payloadText = it.optString("payload_b64").ifBlank { it.optString("data_b64") }
+                    put("payload_b64", payloadText)
+                    put("data_b64", payloadText)
+                    put("file_id", readInt(it, "file_id", null, -1))
+                    put("block", readInt(it, "block", "block_id", -1))
+                    put("symbol", readInt(it, "symbol", "symbol_index", -1))
+                    put("redundant", readBool(it, "is_repair", "redundant", false))
                 }.toString()
             }
             uploaded.writeText(lines.joinToString("\n", postfix = if (lines.isEmpty()) "" else "\n"))
@@ -428,6 +493,27 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             statusText.text = "导出失败：${e.message}"
         }
+    }
+}
+
+private fun readInt(obj: JSONObject, primary: String, fallback: String?, defaultValue: Int): Int {
+    if (obj.has(primary)) return obj.optInt(primary, defaultValue)
+    if (fallback != null && obj.has(fallback)) return obj.optInt(fallback, defaultValue)
+    return defaultValue
+}
+
+private fun readBool(obj: JSONObject, primary: String, fallback: String?, defaultValue: Boolean): Boolean {
+    if (obj.has(primary)) return obj.optBoolean(primary, defaultValue)
+    if (fallback != null && obj.has(fallback)) return obj.optBoolean(fallback, defaultValue)
+    return defaultValue
+}
+
+private fun decodeB64Len(data: String): Int {
+    if (data.isBlank()) return 0
+    return try {
+        android.util.Base64.decode(data, android.util.Base64.DEFAULT).size
+    } catch (_: Exception) {
+        0
     }
 }
 

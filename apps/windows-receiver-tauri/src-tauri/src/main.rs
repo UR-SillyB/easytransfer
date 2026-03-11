@@ -35,13 +35,15 @@ struct Manifest {
 #[derive(Debug, Deserialize, Serialize)]
 struct ReceivedRec {
     symbol_id: String,
-    payload_b64: String,
+    payload_b64: Option<String>,
+    data_b64: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AndroidPayloadRec {
     symbol_id: Option<String>,
     payload_b64: Option<String>,
+    data_b64: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -300,15 +302,20 @@ fn load_symbol_map(path: &str) -> Result<(HashMap<String, Vec<u8>>, usize), Stri
             continue;
         }
         if let Ok(rec) = serde_json::from_str::<ReceivedRec>(line) {
+            let payload_b64 = rec
+                .payload_b64
+                .clone()
+                .or(rec.data_b64.clone())
+                .ok_or_else(|| "payload missing".to_string())?;
             if let Some(existing) = symbol_map.get(&rec.symbol_id) {
-                let current = B64.decode(rec.payload_b64.clone()).map_err(|e| e.to_string())?;
+                let current = B64.decode(payload_b64.clone()).map_err(|e| e.to_string())?;
                 if existing != &current {
                     duplicate_conflicts += 1;
                     continue;
                 }
                 continue;
             }
-            let bytes = B64.decode(rec.payload_b64).map_err(|e| e.to_string())?;
+            let bytes = B64.decode(payload_b64).map_err(|e| e.to_string())?;
             symbol_map.insert(rec.symbol_id, bytes);
             parsed_jsonl = true;
         }
@@ -322,7 +329,8 @@ fn load_symbol_map(path: &str) -> Result<(HashMap<String, Vec<u8>>, usize), Stri
             continue;
         }
         if let Ok(rec) = serde_json::from_str::<AndroidPayloadRec>(line) {
-            if let (Some(symbol_id), Some(payload_b64)) = (rec.symbol_id, rec.payload_b64) {
+            let payload_opt = rec.payload_b64.or(rec.data_b64);
+            if let (Some(symbol_id), Some(payload_b64)) = (rec.symbol_id, payload_opt) {
                 let bytes = B64.decode(payload_b64).map_err(|e| e.to_string())?;
                 if let Some(existing) = symbol_map.get(&symbol_id) {
                     if existing != &bytes {
@@ -392,8 +400,20 @@ fn handle_windows_client(stream: &mut TcpStream, received_path: &Path) -> Result
     }
 
     let rec: ReceivedRec = serde_json::from_str(&body_text).map_err(|e| format!("解析JSON失败: {}", e))?;
-    let _ = B64.decode(rec.payload_b64.clone()).map_err(|e| format!("base64失败: {}", e))?;
-    let line = serde_json::to_string(&rec).map_err(|e| format!("序列化失败: {}", e))?;
+    let payload_b64 = rec
+        .payload_b64
+        .clone()
+        .or(rec.data_b64.clone())
+        .ok_or_else(|| "payload missing".to_string())?;
+    let _ = B64
+        .decode(payload_b64.clone())
+        .map_err(|e| format!("base64失败: {}", e))?;
+    let normalized = ReceivedRec {
+        symbol_id: rec.symbol_id,
+        payload_b64: Some(payload_b64.clone()),
+        data_b64: Some(payload_b64),
+    };
+    let line = serde_json::to_string(&normalized).map_err(|e| format!("序列化失败: {}", e))?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)

@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
-from .compression_layer import CompressionPolicy, build_default_registry, compress_bytes
+from .compression_layer import CompressionPolicy, build_transfer_registry, compress_bytes
 from .utils import iter_chunks, pad_right, utc_now_iso, xor_many
 
 
@@ -87,7 +87,7 @@ def run_sender_pipeline(
     root, file_paths = _collect_files(opts.input_path)
     progress({"event": "scan_done", "file_count": len(file_paths)})
 
-    registry = build_default_registry()
+    registry = build_transfer_registry()
     planned: list[PlannedFile] = []
     for idx, fp in enumerate(file_paths):
         raw = fp.read_bytes()
@@ -132,6 +132,7 @@ def run_sender_pipeline(
                     "v": 1,
                     "kind": "header",
                     "stream_id": stream_id,
+                    "transfer_id": stream_id,
                     "created_utc": utc_now_iso(),
                     "fps": opts.fps,
                     "block_size": opts.block_size,
@@ -165,11 +166,16 @@ def run_sender_pipeline(
                         "v": 1,
                         "kind": "file_header",
                         "frame": frame_id,
+                        "frame_seq": frame_id,
                         "t": _frame_time(frame_id, opts.fps),
+                        "transfer_id": stream_id,
                         "file_id": pf.file_id,
                         "path": pf.rel_path,
+                        "file_name": pf.rel_path,
                         "size": pf.size,
+                        "file_size": pf.size,
                         "codec": pf.codec,
+                        "compression": pf.codec,
                         "codec_params": pf.codec_params,
                     },
                     separators=(",", ":"),
@@ -204,17 +210,24 @@ def run_sender_pipeline(
                                 "v": 1,
                                 "kind": "symbol",
                                 "frame": frame_id,
+                                "frame_seq": frame_id,
                                 "t": _frame_time(frame_id, opts.fps),
+                                "transfer_id": stream_id,
                                 "file_id": pf.file_id,
                                 "path": pf.rel_path,
                                 "block": block_index,
+                                "block_id": block_index,
                                 "block_len": len(block),
                                 "symbol": symbol_index,
+                                "symbol_index": symbol_index,
                                 "symbol_id": sid,
                                 "k": k,
+                                "source_symbol_total": k,
                                 "redundant": False,
+                                "is_repair": False,
                                 "payload_b64": base64.b64encode(symbol_bytes).decode("ascii"),
                                 "crc32": _crc32_u32(symbol_bytes),
+                                "payload_crc32": _crc32_u32(symbol_bytes),
                             },
                             separators=(",", ":"),
                         )
@@ -234,6 +247,9 @@ def run_sender_pipeline(
                         {
                             "symbol_id": rid,
                             "xor_of": xor_of,
+                            "file_id": pf.file_id,
+                            "block": block_index,
+                            "block_id": block_index,
                             "size": len(parity_payload),
                             "sha256": hashlib.sha256(parity_payload).hexdigest(),
                             "file": pf.rel_path,
@@ -245,17 +261,25 @@ def run_sender_pipeline(
                                 "v": 1,
                                 "kind": "symbol",
                                 "frame": frame_id,
+                                "frame_seq": frame_id,
                                 "t": _frame_time(frame_id, opts.fps),
+                                "transfer_id": stream_id,
                                 "file_id": pf.file_id,
                                 "path": pf.rel_path,
                                 "block": block_index,
+                                "block_id": block_index,
                                 "block_len": len(block),
                                 "symbol": k + repair_idx,
+                                "symbol_index": k + repair_idx,
                                 "symbol_id": rid,
                                 "k": k,
+                                "source_symbol_total": k,
                                 "redundant": True,
+                                "is_repair": True,
+                                "repair_of": xor_of,
                                 "payload_b64": base64.b64encode(parity_payload).decode("ascii"),
                                 "crc32": _crc32_u32(parity_payload),
+                                "payload_crc32": _crc32_u32(parity_payload),
                             },
                             separators=(",", ":"),
                         )
@@ -271,10 +295,13 @@ def run_sender_pipeline(
                         "v": 1,
                         "kind": "file_footer",
                         "frame": frame_id,
+                        "frame_seq": frame_id,
                         "t": _frame_time(frame_id, opts.fps),
+                        "transfer_id": stream_id,
                         "file_id": pf.file_id,
                         "path": pf.rel_path,
                         "sha256": pf.sha256,
+                        "file_sha256": pf.sha256,
                         "compressed_bytes": len(pf.compressed),
                         "blocks": file_blocks,
                         "data_symbols": file_source_symbols,
@@ -314,8 +341,10 @@ def run_sender_pipeline(
                     "v": 1,
                     "kind": "eos",
                     "frame": frame_id,
+                    "frame_seq": frame_id,
                     "t": _frame_time(frame_id, opts.fps),
                     "stream_id": stream_id,
+                    "transfer_id": stream_id,
                 },
                 separators=(",", ":"),
             )
@@ -328,7 +357,9 @@ def run_sender_pipeline(
         "version": 1,
         "protocol": "easytransfer/1",
         "stream_id": stream_id,
+        "transfer_id": stream_id,
         "created_utc": utc_now_iso(),
+        "interop": {"codec_profile": "common-v1", "allowed_codecs": list(registry.available())},
         "options": {
             "block_size": opts.block_size,
             "symbol_size": opts.symbol_size,
@@ -397,15 +428,27 @@ def _frame_time(frame: int, fps: float) -> float:
 def _select_repair_indices(k: int, repair_idx: int) -> list[int]:
     if k <= 0:
         return []
-    width = min(max(2, int(math.sqrt(k)) + 1), k)
-    start = (repair_idx * width) % k
-    out: list[int] = []
-    for i in range(width):
-        out.append((start + i) % k)
-    out = sorted(set(out))
-    if not out:
-        out = [repair_idx % k]
-    return out
+    if k == 1:
+        return [0]
+
+    basis_count = max(1, int(math.ceil(math.log2(k + 1))))
+    if repair_idx < basis_count:
+        bit = repair_idx
+        out = [i for i in range(k) if (((i + 1) >> bit) & 1) == 1]
+        if len(out) >= 2:
+            return out
+
+    # Deterministic pseudo-random dense equation for additional repairs.
+    seed = (repair_idx + 1) * 0x9E3779B1
+    width = min(k, max(2, int(math.sqrt(k)) + 2))
+    out_set: set[int] = set()
+    x = seed & 0xFFFFFFFF
+    while len(out_set) < width:
+        x ^= (x << 13) & 0xFFFFFFFF
+        x ^= (x >> 17) & 0xFFFFFFFF
+        x ^= (x << 5) & 0xFFFFFFFF
+        out_set.add(int(x % k))
+    return sorted(out_set)
 
 
 def _xor_for_indices(symbols: list[bytes], indices: Iterable[int]) -> bytes:

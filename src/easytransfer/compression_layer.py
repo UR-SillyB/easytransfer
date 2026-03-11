@@ -21,6 +21,9 @@ except Exception:
 
 MiB = 1024 * 1024
 
+_GZIP_WBITS = zlib.MAX_WBITS | 16
+_DEFLATE_WBITS = -zlib.MAX_WBITS
+
 
 def _require_int(value: object, *, field: str) -> int:
     if isinstance(value, bool):
@@ -40,6 +43,48 @@ class DecompressionError(ValueError):
     """Raised when compressed data is invalid or unsafe to decompress."""
 
     pass
+
+
+def _policy_level(policy: "CompressionPolicy", *, default_level: int = 6) -> int:
+    if policy == CompressionPolicy.FAST_STREAM:
+        return 1
+    if policy == CompressionPolicy.BEST_RATIO:
+        return 9
+    if policy == CompressionPolicy.BALANCED:
+        return default_level
+    return default_level
+
+
+def _decompress_zlib_stream(
+    data: bytes,
+    *,
+    limits: "DecompressionLimits",
+    wbits: int,
+    stream_name: str,
+) -> bytes:
+    limits.validate()
+    if len(data) > limits.max_input_bytes:
+        raise DecompressionError("compressed input exceeds max_input_bytes")
+    d = zlib.decompressobj(wbits)
+    out = bytearray()
+    remaining = limits.max_output_bytes
+    chunk = d.decompress(data, remaining)
+    out += chunk
+    remaining -= len(chunk)
+    while not d.eof:
+        if remaining <= 0:
+            raise DecompressionError("decompressed output exceeds max_output_bytes")
+        chunk = d.decompress(b"", remaining)
+        if not chunk:
+            break
+        out += chunk
+        remaining -= len(chunk)
+    if not d.eof:
+        raise DecompressionError(f"truncated {stream_name} stream")
+    if d.unused_data:
+        raise DecompressionError("unexpected trailing data")
+    _check_decompression_limits(limits, compressed_len=len(data), emitted_len=len(out))
+    return bytes(out)
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,41 +164,40 @@ class _ZlibCodec:
     name: str = "zlib"
 
     def compress(self, data: bytes, *, policy: CompressionPolicy) -> tuple[bytes, dict[str, JSONValue]]:
-        if policy == CompressionPolicy.FAST_STREAM:
-            level = 1
-        elif policy == CompressionPolicy.BALANCED:
-            level = 6
-        elif policy == CompressionPolicy.BEST_RATIO:
-            level = 9
-        else:
-            level = 6
+        level = _policy_level(policy, default_level=6)
         return zlib.compress(data, level), {"level": level}
 
     def decompress(self, data: bytes, *, limits: DecompressionLimits, params: Mapping[str, JSONValue]) -> bytes:
         _ = params
-        limits.validate()
-        if len(data) > limits.max_input_bytes:
-            raise DecompressionError("compressed input exceeds max_input_bytes")
-        d = zlib.decompressobj()
-        out = bytearray()
-        remaining = limits.max_output_bytes
-        chunk = d.decompress(data, remaining)
-        out += chunk
-        remaining -= len(chunk)
-        while not d.eof:
-            if remaining <= 0:
-                raise DecompressionError("decompressed output exceeds max_output_bytes")
-            chunk = d.decompress(b"", remaining)
-            if not chunk:
-                break
-            out += chunk
-            remaining -= len(chunk)
-        if not d.eof:
-            raise DecompressionError("truncated zlib stream")
-        if d.unused_data:
-            raise DecompressionError("unexpected trailing data")
-        _check_decompression_limits(limits, compressed_len=len(data), emitted_len=len(out))
-        return bytes(out)
+        return _decompress_zlib_stream(data, limits=limits, wbits=zlib.MAX_WBITS, stream_name="zlib")
+
+
+class _GzipCodec:
+    name: str = "gzip"
+
+    def compress(self, data: bytes, *, policy: CompressionPolicy) -> tuple[bytes, dict[str, JSONValue]]:
+        level = _policy_level(policy, default_level=6)
+        comp = zlib.compressobj(level=level, method=zlib.DEFLATED, wbits=_GZIP_WBITS)
+        out = comp.compress(data) + comp.flush()
+        return out, {"level": level}
+
+    def decompress(self, data: bytes, *, limits: DecompressionLimits, params: Mapping[str, JSONValue]) -> bytes:
+        _ = params
+        return _decompress_zlib_stream(data, limits=limits, wbits=_GZIP_WBITS, stream_name="gzip")
+
+
+class _DeflateCodec:
+    name: str = "deflate"
+
+    def compress(self, data: bytes, *, policy: CompressionPolicy) -> tuple[bytes, dict[str, JSONValue]]:
+        level = _policy_level(policy, default_level=6)
+        comp = zlib.compressobj(level=level, method=zlib.DEFLATED, wbits=_DEFLATE_WBITS)
+        out = comp.compress(data) + comp.flush()
+        return out, {"level": level}
+
+    def decompress(self, data: bytes, *, limits: DecompressionLimits, params: Mapping[str, JSONValue]) -> bytes:
+        _ = params
+        return _decompress_zlib_stream(data, limits=limits, wbits=_DEFLATE_WBITS, stream_name="deflate")
 
 
 class _Bz2Codec:
@@ -162,12 +206,7 @@ class _Bz2Codec:
     def compress(self, data: bytes, *, policy: CompressionPolicy) -> tuple[bytes, dict[str, JSONValue]]:
         if _bz2 is None:
             raise RuntimeError("bz2 not available")
-        if policy == CompressionPolicy.FAST_STREAM:
-            level = 1
-        elif policy == CompressionPolicy.BALANCED:
-            level = 6
-        else:
-            level = 9
+        level = _policy_level(policy, default_level=6)
         return _bz2.compress(data, compresslevel=level), {"level": level}
 
     def decompress(self, data: bytes, *, limits: DecompressionLimits, params: Mapping[str, JSONValue]) -> bytes:
@@ -211,12 +250,7 @@ class _LzmaCodec:
     def compress(self, data: bytes, *, policy: CompressionPolicy) -> tuple[bytes, dict[str, JSONValue]]:
         if _lzma is None:
             raise RuntimeError("lzma not available")
-        if policy == CompressionPolicy.FAST_STREAM:
-            preset = 1
-        elif policy == CompressionPolicy.BALANCED:
-            preset = 6
-        else:
-            preset = 9
+        preset = _policy_level(policy, default_level=6)
         return _lzma.compress(data, preset=preset, format=_lzma.FORMAT_XZ), {"preset": preset, "format": "xz"}
 
     def decompress(self, data: bytes, *, limits: DecompressionLimits, params: Mapping[str, JSONValue]) -> bytes:
@@ -285,10 +319,23 @@ def build_default_registry() -> CompressionRegistry:
     reg = CompressionRegistry()
     reg.register(_NoneCodec())
     reg.register(_ZlibCodec())
+    reg.register(_GzipCodec())
+    reg.register(_DeflateCodec())
     if _bz2 is not None:
         reg.register(_Bz2Codec())
     if _lzma is not None:
         reg.register(_LzmaCodec())
+    return reg
+
+
+def build_transfer_registry() -> CompressionRegistry:
+    """Create an interop registry shared across sender/scanner/receiver apps."""
+
+    reg = CompressionRegistry()
+    reg.register(_NoneCodec())
+    reg.register(_ZlibCodec())
+    reg.register(_GzipCodec())
+    reg.register(_DeflateCodec())
     return reg
 
 
