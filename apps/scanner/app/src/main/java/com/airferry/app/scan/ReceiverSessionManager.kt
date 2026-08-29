@@ -167,7 +167,9 @@ class ReceiverSessionManager {
             initialized = handle != 0L
             cachedSnapshot = null
         }
-        return initialized && NativeBridge.receiverResume(handle, rootFrameBytes, completedIndices)
+        val resumed = initialized && NativeBridge.receiverResume(handle, rootFrameBytes, completedIndices)
+        if (resumed) cachedSnapshot = null
+        return resumed
     }
 
     /**
@@ -262,11 +264,15 @@ class ReceiverSessionManager {
     }
 
     private fun hexToBytes(s: String): ByteArray {
-        if (s.length % 2 != 0) return ByteArray(0)
-        return ByteArray(s.length / 2) { i ->
-            ((Character.digit(s[i * 2], 16) shl 4) +
-                Character.digit(s[i * 2 + 1], 16)).toByte()
+        if (s.isEmpty() || s.length % 2 != 0) return ByteArray(0)
+        val out = ByteArray(s.length / 2)
+        for (i in out.indices) {
+            val high = Character.digit(s[i * 2], 16)
+            val low = Character.digit(s[i * 2 + 1], 16)
+            if (high < 0 || low < 0) return ByteArray(0)
+            out[i] = ((high shl 4) or low).toByte()
         }
+        return out
     }
 
     private fun snapIsFrozen(snap: Snapshot): Boolean =

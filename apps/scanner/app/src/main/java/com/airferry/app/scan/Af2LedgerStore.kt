@@ -3,6 +3,7 @@ package com.airferry.app.scan
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.RandomAccessFile
 import org.json.JSONObject
 
 /**
@@ -15,9 +16,9 @@ import org.json.JSONObject
  * - Each later line: `{"c":<index>}` (chunk committed after spill+fsync) or
  *   `{"i":<index>}` (chunk invalidated after a re-verification failure).
  *
- * Per-line append + fsync keeps every interleaving crash-safe: a torn tail
- * line fails `JSONObject` parsing and is skipped, so the ledger never
- * reports MORE than what hit the disk. A commit line is only appended after
+ * Per-line append + fsync keeps every interleaving crash-safe: only a torn
+ * final line is skipped; corruption before the tail rejects the candidate,
+ * so the ledger never reports MORE than what hit the disk. A commit line is only appended after
  * the chunk bytes were pwrite + fsync'd into the spill — the §12 ordering
  * rule "账本完成 ⇒ 数据已落盘" holds by construction.
  *
@@ -34,49 +35,113 @@ class Af2LedgerStore private constructor(private val path: File) {
     var rootFrameBytes: ByteArray = ByteArray(0)
         private set
     private val completed = sortedSetOf<Int>()
+    private var headerDurable = false
 
     val completedIndices: IntArray get() = completed.toIntArray()
 
     /** Load an existing ledger for `tid`, or null when none exists. */
     fun reload(): Boolean {
         completed.clear()
+        transferIdHex = ""
+        chunkRawSize = 0
+        rootFrameBytes = ByteArray(0)
+        headerDurable = false
         if (!path.isFile) return false
-        val lines = try {
-            path.readLines()
+        if (path.length() > MAX_LEDGER_BYTES) return false
+        val text = try {
+            path.readText()
         } catch (_: Exception) {
             return false
         }
-        var header: JSONObject? = null
-        for (line in lines) {
-            if (line.isBlank()) continue
+        val originalByteLength = text.toByteArray(Charsets.UTF_8).size.toLong()
+        val tailTerminated = text.endsWith('\n')
+        val durableText = if (tailTerminated) {
+            text
+        } else {
+            val lastNewline = text.lastIndexOf('\n')
+            if (lastNewline < 0) return false // even the header lacks its commit delimiter
+            text.substring(0, lastNewline + 1)
+        }
+        val splitLines = durableText.split('\n')
+        val lines = if (splitLines.lastOrNull()?.isEmpty() == true) {
+            splitLines.dropLast(1)
+        } else {
+            splitLines
+        }
+        // A blank physical record is corruption; filtering it out could hide
+        // a lost invalidation. Only an unterminated final JSON fragment can be
+        // the product of a crash-torn append and may be skipped.
+        if (lines.isEmpty() || lines.any { it.isBlank() }) return false
+        val header = try {
+            JSONObject(lines.first())
+        } catch (_: Exception) {
+            return false
+        }
+        val fileTid = transferIdFromLedgerName(path.name) ?: return false
+        val parsedTid = header.optString("tid", "")
+        val parsedVersion = strictInt(header, "v")
+        val parsedChunkRawSize = strictInt(header, "crs") ?: 0
+        val rootHex = header.optString("root", "")
+        val parsedRoot = if (rootHex.length <= MAX_ROOT_FRAME_HEX_CHARS) {
+            hexToBytes(rootHex)
+        } else {
+            ByteArray(0)
+        }
+        if (
+            header.length() != 4 ||
+            header.opt("tid") !is String ||
+            header.opt("root") !is String ||
+            parsedVersion != 1 ||
+            parsedTid != fileTid ||
+            parsedChunkRawSize !in LEGAL_CHUNK_RAW_SIZES ||
+            parsedRoot.isEmpty()
+        ) return false
+
+        val parsedCompleted = sortedSetOf<Int>()
+        for (position in 1 until lines.size) {
             val o = try {
-                JSONObject(line)
+                JSONObject(lines[position])
             } catch (_: Exception) {
-                continue // torn tail line from a mid-write crash
+                return false
             }
-            if (header == null && o.has("v")) {
-                header = o
-                continue
+            val key = when {
+                o.length() == 1 && o.has("c") -> "c"
+                o.length() == 1 && o.has("i") -> "i"
+                else -> return false
             }
-            // A syntactically valid but malformed/torn record must not abort
-            // the whole candidate scan and hide an older valid ledger.
+            val index = strictInt(o, key) ?: return false
+            if (index !in 0 until MAX_CHUNK_COUNT) return false
+            if (key == "c") parsedCompleted.add(index) else parsedCompleted.remove(index)
+        }
+        if (!tailTerminated) {
+            // Never append after a crash fragment: `fragment + next JSON`
+            // would turn recoverable work into permanent middle corruption.
+            // A record is committed only by its trailing newline, so even a
+            // syntactically-complete unterminated JSON object is discarded.
+            val durableByteLength = durableText.toByteArray(Charsets.UTF_8).size.toLong()
             try {
-                if (o.has("c")) o.optInt("c", -1).takeIf { it >= 0 }?.let(completed::add)
-                if (o.has("i")) o.optInt("i", -1).takeIf { it >= 0 }?.let(completed::remove)
+                RandomAccessFile(path, "rw").use { file ->
+                    if (file.length() != originalByteLength) return false
+                    file.setLength(durableByteLength)
+                    file.fd.sync()
+                }
             } catch (_: Exception) {
-                continue
+                return false
             }
         }
-        val h = header ?: return false
-        transferIdHex = h.optString("tid", "")
-        chunkRawSize = h.optInt("crs", 0)
-        rootFrameBytes = hexToBytes(h.optString("root", ""))
-        return transferIdHex.isNotEmpty() && rootFrameBytes.isNotEmpty()
+        transferIdHex = parsedTid
+        chunkRawSize = parsedChunkRawSize
+        rootFrameBytes = parsedRoot
+        completed.addAll(parsedCompleted)
+        headerDurable = true
+        return true
     }
 
     /** Append one commit event (after the chunk was spilled + fsync'd). */
     @Throws(IOException::class)
     fun commit(index: Int) {
+        require(index in 0 until MAX_CHUNK_COUNT) { "invalid AF2 chunk index: $index" }
+        if (!headerDurable) throw IOException("AF2 ledger header is not durable")
         appendLine(JSONObject().put("c", index))
         completed.add(index)
     }
@@ -84,6 +149,8 @@ class Af2LedgerStore private constructor(private val path: File) {
     /** Append one invalidate event (after a spill re-verification failure). */
     @Throws(IOException::class)
     fun invalidate(index: Int) {
+        require(index in 0 until MAX_CHUNK_COUNT) { "invalid AF2 chunk index: $index" }
+        if (!headerDurable) throw IOException("AF2 ledger header is not durable")
         appendLine(JSONObject().put("i", index))
         completed.remove(index)
     }
@@ -99,6 +166,7 @@ class Af2LedgerStore private constructor(private val path: File) {
     /** Delete the journal (transfer finished / relocked away / abandoned). */
     fun discard() {
         path.delete()
+        headerDurable = false
     }
 
     data class PendingTransfer(
@@ -110,6 +178,22 @@ class Af2LedgerStore private constructor(private val path: File) {
     )
 
     companion object {
+        private const val MAX_CHUNK_COUNT = 131_072
+        private const val MAX_LEDGER_BYTES = 32L * 1024 * 1024
+        private const val MAX_ROOT_FRAME_BYTES = 26 + 2400 + 4
+        private const val MAX_ROOT_FRAME_HEX_CHARS = MAX_ROOT_FRAME_BYTES * 2
+        private val LEGAL_CHUNK_RAW_SIZES = setOf(1, 2, 4, 8, 16, 32).mapTo(mutableSetOf()) {
+            it * 1024 * 1024
+        }
+        private val SAFE_TRANSFER_ID = Regex("^[A-Za-z0-9_-]{1,64}$")
+
+        private fun transferIdFromLedgerName(name: String): String? {
+            val prefix = "af2-"
+            val suffix = ".ledger.jsonl"
+            if (!name.startsWith(prefix) || !name.endsWith(suffix)) return null
+            return name.removePrefix(prefix).removeSuffix(suffix).takeIf { it.matches(SAFE_TRANSFER_ID) }
+        }
+
         /** List all uncompleted/partial transfer ledgers in `dir`. */
         fun listPendingTransfers(dir: File): List<PendingTransfer> {
             val candidates = dir.listFiles { f -> f.name.startsWith("af2-") && f.name.endsWith(".ledger.jsonl") }
@@ -186,7 +270,12 @@ class Af2LedgerStore private constructor(private val path: File) {
             chunkRawSize: Int,
             rootFrameBytes: ByteArray
         ): Af2LedgerStore {
-            val path = File(dir, "af2-${transferIdHex.ifEmpty { "session" }}.ledger.jsonl")
+            require(transferIdHex.matches(SAFE_TRANSFER_ID)) { "invalid AF2 transfer id" }
+            require(chunkRawSize in LEGAL_CHUNK_RAW_SIZES) { "invalid AF2 chunk size" }
+            require(rootFrameBytes.size in 1..MAX_ROOT_FRAME_BYTES) {
+                "invalid AF2 ROOT frame"
+            }
+            val path = File(dir, "af2-$transferIdHex.ledger.jsonl")
             path.delete() // a relock restarts the journal from scratch
             val header = JSONObject()
                 .put("v", 1)
@@ -220,7 +309,8 @@ class Af2LedgerStore private constructor(private val path: File) {
             return Af2LedgerStore(path).apply {
                 this.transferIdHex = transferIdHex
                 this.chunkRawSize = chunkRawSize
-                this.rootFrameBytes = rootFrameBytes
+                this.rootFrameBytes = rootFrameBytes.copyOf()
+                this.headerDurable = true
             }
         }
 
@@ -240,6 +330,14 @@ class Af2LedgerStore private constructor(private val path: File) {
                 if (hi < 0 || lo < 0) return ByteArray(0)
                 ((hi shl 4) + lo).toByte()
             }
+        }
+
+        private fun strictInt(o: JSONObject, key: String): Int? = when (val value = o.opt(key)) {
+            is Int -> value
+            is Long -> value.takeIf {
+                it in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()
+            }?.toInt()
+            else -> null
         }
     }
 }

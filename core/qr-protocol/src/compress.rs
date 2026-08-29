@@ -432,6 +432,35 @@ pub fn decompress_stream_to_file(
 
     let in_file =
         std::fs::File::open(input_path).map_err(|e| Error::Compress(format!("open input: {e}")))?;
+    // `File::create` truncates an existing destination. Reject the input
+    // itself (including symlink aliases and, on Unix, hard links) before that
+    // destructive step; otherwise a caller typo can erase the compressed
+    // source and the failure cleanup below then removes its final directory
+    // entry as well.
+    if let Ok(_out_existing) = std::fs::File::open(output_path) {
+        let same_canonical = std::fs::canonicalize(input_path)
+            .ok()
+            .zip(std::fs::canonicalize(output_path).ok())
+            .is_some_and(|(input, output)| input == output);
+        #[cfg(unix)]
+        let same_identity = {
+            use std::os::unix::fs::MetadataExt;
+            let input = in_file
+                .metadata()
+                .map_err(|e| Error::Compress(format!("input metadata: {e}")))?;
+            let output = _out_existing
+                .metadata()
+                .map_err(|e| Error::Compress(format!("output metadata: {e}")))?;
+            input.dev() == output.dev() && input.ino() == output.ino()
+        };
+        #[cfg(not(unix))]
+        let same_identity = false;
+        if same_canonical || same_identity {
+            return Err(Error::Compress(
+                "input and output must refer to different files".into(),
+            ));
+        }
+    }
     let file_len = in_file
         .metadata()
         .map_err(|e| Error::Compress(format!("input metadata: {e}")))?
@@ -957,6 +986,29 @@ mod tests {
             !output.exists(),
             "failed decode must not leave a partial output file"
         );
+    }
+
+    #[test]
+    fn decompress_stream_to_file_rejects_input_as_output_without_data_loss() {
+        let path = std::env::temp_dir().join(format!(
+            "airferry_same_stream_path_{}.bin",
+            std::process::id()
+        ));
+        let original = b"compressed source must survive";
+        std::fs::write(&path, original).unwrap();
+        let result = decompress_stream_to_file(
+            path.to_str().unwrap(),
+            path.to_str().unwrap(),
+            COMPRESSION_NONE,
+            original.len() as u64,
+        );
+        assert!(result.is_err(), "same input/output path must be rejected");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "rejection must preserve the compressed source"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     /// The clamp must not break legitimate streams: every level/size this

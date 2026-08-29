@@ -368,10 +368,10 @@ struct ChunkDecoderSlot {
 pub struct Af2Receiver {
     root: Option<RootRecord>,
     mismatch_streak: u32,
-    /// Transfer id of the foreign ROOT that owns the current streak; a
-    /// different foreign transfer resets the debounce (alternating streams
-    /// must never evict the lock — "3 *consistent* foreign ROOTs").
-    mismatch_transfer: Option<[u8; 16]>,
+    /// Full foreign ROOT candidate (including its wire T) that owns the current
+    /// streak. Transfer ID alone is insufficient: it does not bind every ROOT
+    /// field, so conflicting records with the same ID must not pool votes.
+    mismatch_candidate: Option<(RootRecord, usize)>,
     /// Debounce a conflicting ROOT that carries the *same* Transfer ID. Without
     /// this independent candidate, one poisoned first ROOT permanently causes
     /// every genuine repeat to be dropped as an inconsistency.
@@ -402,7 +402,7 @@ impl Af2Receiver {
         Af2Receiver {
             root: None,
             mismatch_streak: 0,
-            mismatch_transfer: None,
+            mismatch_candidate: None,
             same_transfer_conflict: None,
             manifest_decoder: None,
             manifest_meta: None,
@@ -424,6 +424,13 @@ impl Af2Receiver {
 
     pub fn root(&self) -> Option<&RootRecord> {
         self.root.as_ref()
+    }
+
+    /// Current consecutive foreign-ROOT debounce count. Host wrappers expose
+    /// this in their packed status and must be able to observe when a genuine
+    /// ROOT clears a previously accumulated candidate.
+    pub fn mismatch_streak(&self) -> u32 {
+        self.mismatch_streak
     }
 
     pub fn manifest(&self) -> Option<&Manifest> {
@@ -584,7 +591,7 @@ impl Af2Receiver {
                 self.root = Some(record);
                 self.t = frame.t;
                 self.mismatch_streak = 0;
-                self.mismatch_transfer = None;
+                self.mismatch_candidate = None;
                 Ok(IngestEvent::RootLocked)
             }
             Some(current) => {
@@ -598,12 +605,15 @@ impl Af2Receiver {
                         && current.chunk_count == record.chunk_count
                         && current.chunk_raw_size == record.chunk_raw_size;
                     if !consistent {
-                        let candidate_matches = self
-                            .same_transfer_conflict
-                            .as_ref()
-                            .is_some_and(|(candidate, candidate_t, _)| {
+                        // This is a different ROOT candidate class from a
+                        // foreign transfer, so it breaks that candidate's run.
+                        self.mismatch_streak = 0;
+                        self.mismatch_candidate = None;
+                        let candidate_matches = self.same_transfer_conflict.as_ref().is_some_and(
+                            |(candidate, candidate_t, _)| {
                                 candidate == &record && *candidate_t == frame.t
-                            });
+                            },
+                        );
                         if candidate_matches {
                             if let Some((_, _, streak)) = &mut self.same_transfer_conflict {
                                 *streak = streak.saturating_add(1);
@@ -631,12 +641,18 @@ impl Af2Receiver {
                             self.chunk_done.clear();
                             self.same_transfer_conflict = None;
                             self.mismatch_streak = 0;
-                            self.mismatch_transfer = None;
+                            self.mismatch_candidate = None;
                             return Ok(IngestEvent::Relocked);
                         }
                         return Ok(IngestEvent::RootMismatch { streak });
                     }
                     self.same_transfer_conflict = None;
+                    // A valid ROOT for the locked transfer breaks any run of
+                    // foreign candidates.  Re-lock debounce is intentionally
+                    // consecutive; otherwise two stale foreign ROOTs could be
+                    // carried across an arbitrary number of genuine ROOTs.
+                    self.mismatch_streak = 0;
+                    self.mismatch_candidate = None;
                     if current.manifest_object_id != record.manifest_object_id {
                         // New Broadcast Instance of the SAME transfer (sender
                         // restarted with a new T / new encoding). Keep the
@@ -656,18 +672,30 @@ impl Af2Receiver {
                     }
                     Ok(IngestEvent::Dropped) // duplicate ROOT
                 } else {
-                    // Foreign transfer: debounce; only ≥3 consistent ones
-                    // re-lock. A *different* foreign transfer resets the
-                    // streak — alternating streams must not evict the lock.
-                    // (A foreign ROOT with a different T still counts: the
-                    // re-lock resets T, so a stale T can never wedge us.)
-                    if self.mismatch_transfer != Some(transfer) {
+                    // Foreign transfer: debounce; only ≥3 byte-consistent ROOTs
+                    // re-lock. Transfer ID alone does not bind content_id,
+                    // geometry, manifest_object_id, or T, so the full record +
+                    // T defines a candidate class. Alternating candidates must
+                    // never evict the lock.
+                    self.same_transfer_conflict = None;
+                    let candidate_matches =
+                        self.mismatch_candidate
+                            .as_ref()
+                            .is_some_and(|(candidate, candidate_t)| {
+                                candidate == &record && *candidate_t == frame.t
+                            });
+                    if !candidate_matches {
                         self.mismatch_streak = 0;
-                        self.mismatch_transfer = Some(transfer);
+                        self.mismatch_candidate = Some((record.clone(), frame.t));
                     }
-                    self.mismatch_streak += 1;
+                    self.mismatch_streak = self.mismatch_streak.saturating_add(1);
                     if self.mismatch_streak >= MISMATCH_RELOCK_THRESHOLD {
-                        self.root = None;
+                        // The threshold-crossing ROOT is already the third
+                        // byte-consistent candidate, so bind it atomically.
+                        // Reporting Relocked while leaving the receiver idle
+                        // would otherwise discard the following META/SYMBOL
+                        // frames until the playlist happens to repeat ROOT.
+                        self.root = Some(record);
                         self.manifest_decoder = None;
                         self.manifest_meta = None;
                         self.manifest = None;
@@ -675,10 +703,9 @@ impl Af2Receiver {
                         self.chunk_decoder = None;
                         self.chunk_done.clear();
                         self.mismatch_streak = 0;
-                        self.mismatch_transfer = None;
+                        self.mismatch_candidate = None;
                         self.same_transfer_conflict = None;
-                        self.t = 0;
-                        // Re-ingest this ROOT on the next frame (state now Idle).
+                        self.t = frame.t;
                         Ok(IngestEvent::Relocked)
                     } else {
                         Ok(IngestEvent::RootMismatch {
@@ -1372,6 +1399,7 @@ mod tests {
         let data = vec![1u8; 1000];
         let bc = build_broadcast(&data, 1 << 20, 1024);
         let other = build_broadcast(&vec![2u8; 1000], 1 << 20, 1024);
+        let other_object_id = Af2Frame::from_bytes(&other.root_frame).unwrap().object_id;
         let mut rx = Af2Receiver::new();
         let _ = rx.ingest(&bc.root_frame).unwrap();
         assert_eq!(
@@ -1388,11 +1416,9 @@ mod tests {
             IngestEvent::Dropped
         );
         assert_eq!(rx.ingest(&other.root_frame).unwrap(), IngestEvent::Relocked);
-        // After the re-lock the new transfer's ROOT binds again.
-        assert_eq!(
-            rx.ingest(&other.root_frame).unwrap(),
-            IngestEvent::RootLocked
-        );
+        assert_eq!(rx.root().map(RootRecord::transfer), Some(other_object_id));
+        // The threshold-crossing ROOT is the lock; another copy is a duplicate.
+        assert_eq!(rx.ingest(&other.root_frame).unwrap(), IngestEvent::Dropped);
     }
 
     #[test]
@@ -1415,7 +1441,10 @@ mod tests {
         assert_eq!(rx.ingest(&poisoned_frame).unwrap(), IngestEvent::RootLocked);
         assert_eq!(
             rx.ingest(&bc.manifest_meta_frame).unwrap(),
-            IngestEvent::MetaBound { role: ROLE_MANIFEST, object_index: 0 }
+            IngestEvent::MetaBound {
+                role: ROLE_MANIFEST,
+                object_index: 0
+            }
         );
         let mut geometry_rejected = false;
         for symbol in &bc.manifest_symbol_frames {
@@ -1424,10 +1453,19 @@ mod tests {
                 break;
             }
         }
-        assert!(geometry_rejected, "ROOT/Manifest geometry mismatch must fail");
+        assert!(
+            geometry_rejected,
+            "ROOT/Manifest geometry mismatch must fail"
+        );
 
-        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootMismatch { streak: 1 });
-        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootMismatch { streak: 2 });
+        assert_eq!(
+            rx.ingest(&bc.root_frame).unwrap(),
+            IngestEvent::RootMismatch { streak: 1 }
+        );
+        assert_eq!(
+            rx.ingest(&bc.root_frame).unwrap(),
+            IngestEvent::RootMismatch { streak: 2 }
+        );
         assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::Relocked);
         assert_eq!(rx.root().unwrap().total_raw_size, data.len() as u64);
     }
@@ -1438,12 +1476,18 @@ mod tests {
         let frame = Af2Frame::from_bytes(&bc.root_frame).unwrap();
         let mut root = RootRecord::parse(&frame.body).unwrap();
         root.manifest_object_id = [0xA5; 16];
-        let root_frame = Af2Frame { body: root.encode().unwrap(), ..frame }
-            .to_bytes()
-            .unwrap();
+        let root_frame = Af2Frame {
+            body: root.encode().unwrap(),
+            ..frame
+        }
+        .to_bytes()
+        .unwrap();
         let mut rx = Af2Receiver::new();
         assert_eq!(rx.ingest(&root_frame).unwrap(), IngestEvent::RootLocked);
-        assert_eq!(rx.ingest(&bc.manifest_meta_frame).unwrap(), IngestEvent::MetaRejected);
+        assert_eq!(
+            rx.ingest(&bc.manifest_meta_frame).unwrap(),
+            IngestEvent::MetaRejected
+        );
     }
 
     #[test]
@@ -1490,6 +1534,113 @@ mod tests {
         // Still locked to the original transfer: its ROOT is a consistent
         // duplicate (Dropped), not a fresh lock (RootLocked).
         assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::Dropped);
+    }
+
+    #[test]
+    fn foreign_roots_must_match_full_record_and_t_to_relock() {
+        let bc = build_broadcast(&vec![1u8; 1000], 1 << 20, 1024);
+        let foreign = build_broadcast(&vec![2u8; 1000], 1 << 20, 1024);
+
+        // Transfer ID binds manifest_hash + chunk_raw_size, but not every ROOT
+        // field. Craft a second legal record with the same Transfer ID and a
+        // conflicting content identity, plus a third candidate with another T.
+        let foreign_frame = Af2Frame::from_bytes(&foreign.root_frame).unwrap();
+        let mut conflicting_root = RootRecord::parse(&foreign_frame.body).unwrap();
+        conflicting_root.content_id[0] ^= 0xFF;
+        let conflicting_frame = Af2Frame {
+            body: conflicting_root.encode().unwrap(),
+            ..Af2Frame::from_bytes(&foreign.root_frame).unwrap()
+        }
+        .to_bytes()
+        .unwrap();
+        let different_t_frame = Af2Frame {
+            t: 2048,
+            ..Af2Frame::from_bytes(&foreign.root_frame).unwrap()
+        }
+        .to_bytes()
+        .unwrap();
+
+        let mut rx = Af2Receiver::new();
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootLocked);
+        for candidate in [&foreign.root_frame, &conflicting_frame, &different_t_frame] {
+            assert_eq!(
+                rx.ingest(candidate).unwrap(),
+                IngestEvent::RootMismatch { streak: 1 }
+            );
+        }
+        assert_eq!(
+            rx.ingest(&foreign.root_frame).unwrap(),
+            IngestEvent::RootMismatch { streak: 1 }
+        );
+        assert_eq!(
+            rx.ingest(&foreign.root_frame).unwrap(),
+            IngestEvent::RootMismatch { streak: 2 }
+        );
+        assert_eq!(
+            rx.ingest(&foreign.root_frame).unwrap(),
+            IngestEvent::Relocked
+        );
+    }
+
+    #[test]
+    fn genuine_root_breaks_foreign_relock_streak() {
+        let bc = build_broadcast(&vec![1u8; 1000], 1 << 20, 1024);
+        let other = build_broadcast(&vec![2u8; 1000], 1 << 20, 1024);
+        let mut rx = Af2Receiver::new();
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootLocked);
+        assert_eq!(
+            rx.ingest(&other.root_frame).unwrap(),
+            IngestEvent::RootMismatch { streak: 1 }
+        );
+        assert_eq!(
+            rx.ingest(&other.root_frame).unwrap(),
+            IngestEvent::RootMismatch { streak: 2 }
+        );
+
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::Dropped);
+        assert_eq!(
+            rx.ingest(&other.root_frame).unwrap(),
+            IngestEvent::RootMismatch { streak: 1 }
+        );
+    }
+
+    #[test]
+    fn distinct_root_candidate_classes_break_each_others_streaks() {
+        let bc = build_broadcast(&vec![1u8; 1000], 1 << 20, 1024);
+        let foreign = build_broadcast(&vec![2u8; 1000], 1 << 20, 1024);
+        let frame = Af2Frame::from_bytes(&bc.root_frame).unwrap();
+        let mut conflict = RootRecord::parse(&frame.body).unwrap();
+        conflict.total_raw_size = 999;
+        let conflict_frame = Af2Frame {
+            body: conflict.encode().unwrap(),
+            ..frame
+        }
+        .to_bytes()
+        .unwrap();
+
+        let mut rx = Af2Receiver::new();
+        assert_eq!(rx.ingest(&bc.root_frame).unwrap(), IngestEvent::RootLocked);
+        let _ = rx.ingest(&foreign.root_frame).unwrap();
+        let _ = rx.ingest(&foreign.root_frame).unwrap();
+        assert_eq!(
+            rx.ingest(&conflict_frame).unwrap(),
+            IngestEvent::RootMismatch { streak: 1 }
+        );
+        assert_eq!(
+            rx.ingest(&foreign.root_frame).unwrap(),
+            IngestEvent::RootMismatch { streak: 1 }
+        );
+
+        let _ = rx.ingest(&conflict_frame).unwrap();
+        let _ = rx.ingest(&conflict_frame).unwrap();
+        assert_eq!(
+            rx.ingest(&foreign.root_frame).unwrap(),
+            IngestEvent::RootMismatch { streak: 1 }
+        );
+        assert_eq!(
+            rx.ingest(&conflict_frame).unwrap(),
+            IngestEvent::RootMismatch { streak: 1 }
+        );
     }
 
     #[test]
@@ -1724,11 +1875,8 @@ mod tests {
             IngestEvent::RootMismatch { .. }
         ));
         assert_eq!(rx.ingest(&other.root_frame).unwrap(), IngestEvent::Relocked);
-        assert_eq!(
-            rx.ingest(&other.root_frame).unwrap(),
-            IngestEvent::RootLocked
-        );
-        assert_eq!(rx.symbol_size(), 2048, "T re-binds at the new lock");
+        assert_eq!(rx.symbol_size(), 2048, "T re-binds on the re-locking ROOT");
+        assert_eq!(rx.ingest(&other.root_frame).unwrap(), IngestEvent::Dropped);
     }
 
     #[test]

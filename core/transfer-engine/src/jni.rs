@@ -234,7 +234,7 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverAsse
     handle: jlong,
     index: jint,
 ) -> jni::sys::jbyteArray {
-    if handle == 0 {
+    if handle == 0 || index < 0 {
         return null_byte_array(&mut env);
     }
     let session = unsafe { &mut *(handle as *mut ReceiverSession) };
@@ -270,7 +270,10 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverLast
         return -1;
     }
     let session = unsafe { &*(handle as *const ReceiverSession) };
-    session.last_completed_chunk_index().map(|i| i as jint).unwrap_or(-1)
+    session
+        .last_completed_chunk_index()
+        .map(|i| i as jint)
+        .unwrap_or(-1)
 }
 
 /// Release a persisted chunk from native memory (eviction). Returns true when
@@ -298,7 +301,7 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverVeri
     index: jint,
     raw_bytes: jni::sys::jbyteArray,
 ) -> jni::sys::jboolean {
-    if handle == 0 || raw_bytes.is_null() {
+    if handle == 0 || index < 0 || raw_bytes.is_null() {
         return false as jni::sys::jboolean;
     }
     let session = unsafe { &*(handle as *const ReceiverSession) };
@@ -306,7 +309,8 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverVeri
     // borrows it, and a temporary (`&JByteArray::from_raw(...)`) would be
     // dropped while the returned element view is still in use (E0716).
     let arr = unsafe { jni::objects::JByteArray::from_raw(raw_bytes) };
-    let bytes = match unsafe { env.get_array_elements(&arr, jni::objects::ReleaseMode::NoCopyBack) } {
+    let bytes = match unsafe { env.get_array_elements(&arr, jni::objects::ReleaseMode::NoCopyBack) }
+    {
         Ok(elems) => elems,
         Err(_) => return false as jni::sys::jboolean,
     };
@@ -327,7 +331,8 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverVeri
     }
     let session = unsafe { &*(handle as *const ReceiverSession) };
     let arr = unsafe { jni::objects::JByteArray::from_raw(stream_bytes) };
-    let bytes = match unsafe { env.get_array_elements(&arr, jni::objects::ReleaseMode::NoCopyBack) } {
+    let bytes = match unsafe { env.get_array_elements(&arr, jni::objects::ReleaseMode::NoCopyBack) }
+    {
         Ok(elems) => elems,
         Err(_) => return false as jni::sys::jboolean,
     };
@@ -362,7 +367,8 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverFina
     }
     let session = unsafe { &mut *(handle as *mut ReceiverSession) };
     let arr = unsafe { jni::objects::JByteArray::from_raw(stream_bytes) };
-    let bytes = match unsafe { env.get_array_elements(&arr, jni::objects::ReleaseMode::NoCopyBack) } {
+    let bytes = match unsafe { env.get_array_elements(&arr, jni::objects::ReleaseMode::NoCopyBack) }
+    {
         Ok(elems) => elems,
         Err(_) => return false as jni::sys::jboolean,
     };
@@ -398,22 +404,24 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverResu
     }
     let session = unsafe { &mut *(handle as *mut ReceiverSession) };
     let root_arr = unsafe { jni::objects::JByteArray::from_raw(root_frame_bytes) };
-    let r_bytes = match unsafe { env.get_array_elements(&root_arr, jni::objects::ReleaseMode::NoCopyBack) } {
-        Ok(elems) => elems,
-        Err(_) => return false as jni::sys::jboolean,
-    };
-    let r_slice = unsafe { std::slice::from_raw_parts(r_bytes.as_ptr() as *const u8, r_bytes.len()) };
+    let r_bytes =
+        match unsafe { env.get_array_elements(&root_arr, jni::objects::ReleaseMode::NoCopyBack) } {
+            Ok(elems) => elems,
+            Err(_) => return false as jni::sys::jboolean,
+        };
+    let r_slice =
+        unsafe { std::slice::from_raw_parts(r_bytes.as_ptr() as *const u8, r_bytes.len()) };
     let idx_arr = unsafe { jni::objects::JIntArray::from_raw(completed_indices) };
-    let c_elems = match unsafe { env.get_array_elements(&idx_arr, jni::objects::ReleaseMode::NoCopyBack) } {
-        Ok(elems) => elems,
-        Err(_) => return false as jni::sys::jboolean,
-    };
-    let completed_u32: Vec<u32> = unsafe {
-        std::slice::from_raw_parts(c_elems.as_ptr(), c_elems.len())
-            .iter()
-            .map(|&x| x as u32)
-            .collect()
-    };
+    let c_elems =
+        match unsafe { env.get_array_elements(&idx_arr, jni::objects::ReleaseMode::NoCopyBack) } {
+            Ok(elems) => elems,
+            Err(_) => return false as jni::sys::jboolean,
+        };
+    let completed = unsafe { std::slice::from_raw_parts(c_elems.as_ptr(), c_elems.len()) };
+    if completed.iter().any(|&index| index < 0) {
+        return false as jni::sys::jboolean;
+    }
+    let completed_u32: Vec<u32> = completed.iter().map(|&index| index as u32).collect();
     session.resume(r_slice, &completed_u32) as jni::sys::jboolean
 }
 

@@ -94,10 +94,15 @@ JNIEXPORT jbyteArray JNICALL
 Java_com_airferry_app_scan_ZxingDecoder_decodeY(
     JNIEnv* env, jobject, jbyteArray y_plane, jint width, jint height, jint row_stride)
 {
-    auto pinned = PinY(env, y_plane, width, height, row_stride);
-    if (!pinned) return nullptr;
-    return ToJavaResult(env, AirFerryZxing::DecodeOneFull(
-        reinterpret_cast<const uint8_t*>(pinned->bytes), pinned->len, width, height, row_stride));
+    try {
+        auto pinned = PinY(env, y_plane, width, height, row_stride);
+        if (!pinned) return nullptr;
+        return ToJavaResult(env, AirFerryZxing::DecodeOneFull(
+            reinterpret_cast<const uint8_t*>(pinned->bytes), pinned->len,
+            width, height, row_stride));
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 JNIEXPORT jbyteArray JNICALL
@@ -105,12 +110,17 @@ Java_com_airferry_app_scan_ZxingDecoder_decodeYTracked(
     JNIEnv* env, jobject, jbyteArray y_plane, jint width, jint height,
     jint row_stride, jintArray out_bbox)
 {
-    auto pinned = PinY(env, y_plane, width, height, row_stride);
-    if (!pinned) return nullptr;
-    const auto result = AirFerryZxing::DecodeOneFull(
-        reinterpret_cast<const uint8_t*>(pinned->bytes), pinned->len, width, height, row_stride);
-    if (result) WriteBbox(env, out_bbox, result->bbox);
-    return ToJavaResult(env, result);
+    try {
+        auto pinned = PinY(env, y_plane, width, height, row_stride);
+        if (!pinned) return nullptr;
+        const auto result = AirFerryZxing::DecodeOneFull(
+            reinterpret_cast<const uint8_t*>(pinned->bytes), pinned->len,
+            width, height, row_stride);
+        if (result) WriteBbox(env, out_bbox, result->bbox);
+        return ToJavaResult(env, result);
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 JNIEXPORT jbyteArray JNICALL
@@ -118,11 +128,15 @@ Java_com_airferry_app_scan_ZxingDecoder_decodeYRegion(
     JNIEnv* env, jobject, jbyteArray y_plane, jint width, jint height,
     jint row_stride, jint x, jint y, jint side)
 {
-    auto pinned = PinY(env, y_plane, width, height, row_stride);
-    if (!pinned) return nullptr;
-    return ToJavaResult(env, AirFerryZxing::DecodeOneRegion(
-        reinterpret_cast<const uint8_t*>(pinned->bytes), pinned->len,
-        width, height, row_stride, x, y, side));
+    try {
+        auto pinned = PinY(env, y_plane, width, height, row_stride);
+        if (!pinned) return nullptr;
+        return ToJavaResult(env, AirFerryZxing::DecodeOneRegion(
+            reinterpret_cast<const uint8_t*>(pinned->bytes), pinned->len,
+            width, height, row_stride, x, y, side));
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 JNIEXPORT jbyteArray JNICALL
@@ -130,23 +144,32 @@ Java_com_airferry_app_scan_ZxingDecoder_decodeYRegionTracked(
     JNIEnv* env, jobject, jbyteArray y_plane, jint width, jint height,
     jint row_stride, jint x, jint y, jint side, jintArray out_bbox)
 {
-    auto pinned = PinY(env, y_plane, width, height, row_stride);
-    if (!pinned) return nullptr;
-    const auto result = AirFerryZxing::DecodeOneRegion(
-        reinterpret_cast<const uint8_t*>(pinned->bytes), pinned->len,
-        width, height, row_stride, x, y, side);
-    if (result) WriteBbox(env, out_bbox, result->bbox);
-    return ToJavaResult(env, result);
+    try {
+        auto pinned = PinY(env, y_plane, width, height, row_stride);
+        if (!pinned) return nullptr;
+        const auto result = AirFerryZxing::DecodeOneRegion(
+            reinterpret_cast<const uint8_t*>(pinned->bytes), pinned->len,
+            width, height, row_stride, x, y, side);
+        if (result) WriteBbox(env, out_bbox, result->bbox);
+        return ToJavaResult(env, result);
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 JNIEXPORT jbyteArray JNICALL
 Java_com_airferry_app_scan_ZxingDecoder_decodeMultiY(
     JNIEnv* env, jobject, jbyteArray y_plane, jint width, jint height, jint row_stride)
 {
-    auto pinned = PinY(env, y_plane, width, height, row_stride);
-    if (!pinned) return nullptr;
-    return ToJavaMulti(env, AirFerryZxing::DecodeMultiFull(
-        reinterpret_cast<const uint8_t*>(pinned->bytes), pinned->len, width, height, row_stride));
+    try {
+        auto pinned = PinY(env, y_plane, width, height, row_stride);
+        if (!pinned) return nullptr;
+        return ToJavaMulti(env, AirFerryZxing::DecodeMultiFull(
+            reinterpret_cast<const uint8_t*>(pinned->bytes), pinned->len,
+            width, height, row_stride));
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 JNIEXPORT jbyteArray JNICALL
@@ -154,25 +177,34 @@ Java_com_airferry_app_scan_ZxingDecoder_decodeMultiYTracked(
     JNIEnv* env, jobject, jbyteArray y_plane, jint width, jint height,
     jint row_stride, jintArray hints, jint hint_count, jfloat margin_fraction)
 {
-    if (hints == nullptr || hint_count <= 0 ||
-        hint_count > static_cast<jint>(AirFerryZxing::MaxTrackedCodes) ||
-        env->GetArrayLength(hints) < hint_count * 4) {
+    try {
+        if (hints == nullptr || hint_count <= 0 ||
+            hint_count > static_cast<jint>(AirFerryZxing::MaxTrackedCodes) ||
+            env->GetArrayLength(hints) < hint_count * 4) {
+            return nullptr;
+        }
+        jint* hint_values = env->GetIntArrayElements(hints, nullptr);
+        if (hint_values == nullptr) return nullptr;
+        auto pinned = PinY(env, y_plane, width, height, row_stride);
+        std::vector<AirFerryZxing::DecodeResult> results;
+        try {
+            if (pinned) {
+                static_assert(sizeof(jint) == sizeof(int32_t));
+                results = AirFerryZxing::DecodeMultiRegions(
+                    reinterpret_cast<const uint8_t*>(pinned->bytes), pinned->len,
+                    width, height, row_stride,
+                    reinterpret_cast<const int32_t*>(hint_values),
+                    static_cast<size_t>(hint_count), margin_fraction);
+            }
+        } catch (...) {
+            env->ReleaseIntArrayElements(hints, hint_values, JNI_ABORT);
+            return nullptr;
+        }
+        env->ReleaseIntArrayElements(hints, hint_values, JNI_ABORT);
+        return ToJavaMulti(env, results);
+    } catch (...) {
         return nullptr;
     }
-    jint* hint_values = env->GetIntArrayElements(hints, nullptr);
-    if (hint_values == nullptr) return nullptr;
-    auto pinned = PinY(env, y_plane, width, height, row_stride);
-    std::vector<AirFerryZxing::DecodeResult> results;
-    if (pinned) {
-        static_assert(sizeof(jint) == sizeof(int32_t));
-        results = AirFerryZxing::DecodeMultiRegions(
-            reinterpret_cast<const uint8_t*>(pinned->bytes), pinned->len,
-            width, height, row_stride,
-            reinterpret_cast<const int32_t*>(hint_values),
-            static_cast<size_t>(hint_count), margin_fraction);
-    }
-    env->ReleaseIntArrayElements(hints, hint_values, JNI_ABORT);
-    return ToJavaMulti(env, results);
 }
 
 }  // extern "C"

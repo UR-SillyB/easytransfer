@@ -718,13 +718,29 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 try { File.Delete(spillPath); } catch { }
                 continue;
             }
+            ReceiverSession.Snapshot resumed = session.GetSnapshot();
+            if (!string.Equals(resumed.TransferIdHex, ledger.TransferIdHex, StringComparison.Ordinal) ||
+                resumed.ChunkRawSize != (uint)ledger.ChunkRawSize || resumed.ChunkCount == 0)
+            {
+                // The ROOT is authoritative. Reset the native lock before
+                // trying an older candidate whose header/storage pair may be valid.
+                ledger.Discard();
+                try { File.Delete(spillPath); } catch { }
+                session.Dispose();
+                session = new ReceiverSession();
+                _session = session;
+                continue;
+            }
+            int[] validCompleted = ledger.CompletedIndices
+                .Where(index => (uint)index < resumed.ChunkCount)
+                .ToArray();
             _af2Ledger = ledger;
             // deleteExisting: false — the spill file holds this transfer's durable
             // chunk bytes; the ctor's orphan-wipe must not destroy it. The ledger
             // bits say which chunks are physically present in it.
             _chunkSpill = new ChunkSpillStore(TempDir, ledger.TransferIdHex, deleteExisting: false);
-            _chunkSpill.MarkResumed(ledger.CompletedIndices);
-            _pendingReverify = new SortedSet<int>(ledger.CompletedIndices);
+            _chunkSpill.MarkResumed(validCompleted);
+            _pendingReverify = new SortedSet<int>(validCompleted);
             return true;
         }
     }
@@ -2026,13 +2042,19 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     /// </summary>
     public static string ArchiveSingleFile(string sourcePath, string displayName)
     {
-        if (File.Exists(sourcePath) &&
-            sourcePath.StartsWith(ContentStore.RootDir, StringComparison.OrdinalIgnoreCase))
+        if (!File.Exists(sourcePath))
         {
-            return sourcePath;
+            throw new FileNotFoundException("待归档文件不存在", sourcePath);
         }
-        byte[] bytes = File.Exists(sourcePath) ? File.ReadAllBytes(sourcePath) : [];
-        return ContentStore.PutBytes(displayName, bytes).Path;
+        string fullSource = Path.GetFullPath(sourcePath);
+        string blobRoot = Path.GetFullPath(Path.Combine(ContentStore.RootDir, "blobs"));
+        string blobPrefix = Path.TrimEndingDirectorySeparator(blobRoot) +
+            Path.DirectorySeparatorChar;
+        if (fullSource.StartsWith(blobPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return fullSource;
+        }
+        return ContentStore.PutFile(displayName, fullSource).Path;
     }
 
     /// <summary>Archive a bundle into ContentStore (content-addressed members).</summary>

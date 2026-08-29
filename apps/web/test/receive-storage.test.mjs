@@ -5,6 +5,13 @@ import { ChunkStore, OpfsJournal, sweepOrphanPartials } from "../src/workers/rec
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
+const TID_JOURNALED = "11111111111111111111111111111111"
+const TID_OLDER = "22222222222222222222222222222222"
+const TID_CAFE = "33333333333333333333333333333333"
+const TID_WRITE_FAIL = "44444444444444444444444444444444"
+const TID_REMOVE_FAIL = "55555555555555555555555555555555"
+const TID_BEEF = "66666666666666666666666666666666"
+const LEGAL_CHUNK_SIZE = 1024 * 1024
 
 class FakeFileHandle {
   constructor(name) {
@@ -84,6 +91,12 @@ class FakeFileHandle {
       async seek(next) {
         position = next
       },
+      async truncate(size) {
+        const resized = new Uint8Array(size)
+        resized.set(working.subarray(0, size))
+        working = resized
+        position = Math.min(position, size)
+      },
       async write(value) {
         if (file.failWritableWrite) throw new Error("simulated journal write failure")
         const source = typeof value === "string" ? encoder.encode(value) : new Uint8Array(value)
@@ -127,6 +140,13 @@ class FakeDirectoryHandle {
   async *entries() {
     yield* this.files.entries()
   }
+}
+
+async function appendText(handle, text) {
+  const writer = await handle.createWritable({ keepExistingData: true })
+  await writer.seek((await handle.getFile()).size)
+  await writer.write(text)
+  await writer.close()
 }
 
 test("ChunkStore acquires one exclusive OPFS handle per transfer", async () => {
@@ -298,9 +318,9 @@ test("sweepOrphanPartials removes ledger-less partials and keeps journaled ones"
   const dir = new FakeDirectoryHandle()
   // A journaled (in-progress-or-resumable) transfer: partial + ledger.
   const journaled = new OpfsJournal()
-  await journaled.init(dir, "hasledger", 4, "0102")
+  await journaled.init(dir, TID_JOURNALED, LEGAL_CHUNK_SIZE, "0102")
   const live = new ChunkStore()
-  await live.init(dir, "hasledger")
+  await live.init(dir, TID_JOURNALED)
   assert.equal(live.writeChunk(0, 4, Uint8Array.from([2, 2, 2, 2])), "disk")
   // An orphan partial: released after a delivered transfer (ledger discarded).
   const owned = new ChunkStore()
@@ -309,8 +329,8 @@ test("sweepOrphanPartials removes ledger-less partials and keeps journaled ones"
 
   await sweepOrphanPartials(dir, 0)
 
-  assert.ok(dir.files.has("af2-hasledger.partial"))
-  assert.ok(dir.files.has("af2-hasledger.ledger.jsonl"))
+  assert.ok(dir.files.has(`af2-${TID_JOURNALED}.partial`))
+  assert.ok(dir.files.has(`af2-${TID_JOURNALED}.ledger.jsonl`))
   assert.equal(dir.files.has("af2-orphan.partial"), false)
 })
 
@@ -350,9 +370,9 @@ test("sweepOrphanPartials preserves a fresh delivered partial during the grace p
 test("OpfsJournal loadMostRecent skips a corrupt newer journal", async () => {
   const dir = new FakeDirectoryHandle()
   const valid = new OpfsJournal()
-  await valid.init(dir, "older", 4, "01020304")
+  await valid.init(dir, TID_OLDER, LEGAL_CHUNK_SIZE, "01020304")
   await valid.commit(2)
-  dir.files.get("af2-older.ledger.jsonl").lastModified = 100
+  dir.files.get(`af2-${TID_OLDER}.ledger.jsonl`).lastModified = 100
 
   const bad = await dir.getFileHandle("af2-newer.ledger.jsonl", { create: true })
   const w = await bad.createWritable()
@@ -361,21 +381,93 @@ test("OpfsJournal loadMostRecent skips a corrupt newer journal", async () => {
   bad.lastModified = 200
 
   const loaded = await OpfsJournal.loadMostRecent(dir)
-  assert.equal(loaded.transferIdHex, "older")
+  assert.equal(loaded.transferIdHex, TID_OLDER)
   assert.deepEqual(loaded.completed, [2])
+})
+
+test("OpfsJournal binds the header transfer id to its canonical filename", async () => {
+  const dir = new FakeDirectoryHandle()
+  const handle = await dir.getFileHandle(`af2-${TID_CAFE}.ledger.jsonl`, { create: true })
+  const writer = await handle.createWritable()
+  await writer.write(JSON.stringify({
+    v: 1,
+    tid: TID_BEEF,
+    crs: LEGAL_CHUNK_SIZE,
+    root: "01020304",
+  }) + "\n")
+  await writer.close()
+
+  assert.equal(await OpfsJournal.loadMostRecent(dir), null)
+})
+
+test("OpfsJournal rejects out-of-protocol records and non-trailing corruption", async () => {
+  const dir = new FakeDirectoryHandle()
+  const journal = new OpfsJournal()
+  await journal.init(dir, TID_CAFE, LEGAL_CHUNK_SIZE, "01020304")
+  const handle = dir.files.get(`af2-${TID_CAFE}.ledger.jsonl`)
+  await appendText(handle, `${JSON.stringify({ c: 131_072 })}\n`)
+  assert.equal(await OpfsJournal.loadMostRecent(dir), null)
+
+  await journal.init(dir, TID_BEEF, LEGAL_CHUNK_SIZE, "01020304")
+  await journal.commit(1)
+  const second = dir.files.get(`af2-${TID_BEEF}.ledger.jsonl`)
+  await appendText(second, "{torn\n" + JSON.stringify({ c: 2 }) + "\n")
+  assert.equal(await OpfsJournal.loadMostRecent(dir), null)
+})
+
+test("OpfsJournal keeps valid commits before a torn final append", async () => {
+  const dir = new FakeDirectoryHandle()
+  const journal = new OpfsJournal()
+  await journal.init(dir, TID_BEEF, LEGAL_CHUNK_SIZE, "01020304")
+  await journal.commit(3)
+  const handle = dir.files.get(`af2-${TID_BEEF}.ledger.jsonl`)
+  await appendText(handle, "{torn")
+
+  const loaded = await OpfsJournal.loadMostRecent(dir)
+  assert.deepEqual(loaded.completed, [3])
+  assert.equal(decoder.decode(handle.bytes).endsWith("\n"), true)
+})
+
+test("OpfsJournal truncates a complete unterminated record before later appends", async () => {
+  const dir = new FakeDirectoryHandle()
+  const first = new OpfsJournal()
+  await first.init(dir, TID_CAFE, LEGAL_CHUNK_SIZE, "01020304")
+  await first.commit(1)
+  const handle = dir.files.get(`af2-${TID_CAFE}.ledger.jsonl`)
+  await appendText(handle, JSON.stringify({ c: 2 }))
+
+  const loaded = await OpfsJournal.loadMostRecent(dir)
+  assert.deepEqual(loaded.completed, [1])
+
+  const resumed = new OpfsJournal()
+  await resumed.openExisting(dir, TID_CAFE)
+  await resumed.commit(3)
+  const reloaded = await OpfsJournal.loadMostRecent(dir)
+  assert.deepEqual(reloaded.completed, [1, 3])
+})
+
+test("OpfsJournal rejects a malformed final record that reached its newline", async () => {
+  const dir = new FakeDirectoryHandle()
+  const journal = new OpfsJournal()
+  await journal.init(dir, TID_CAFE, LEGAL_CHUNK_SIZE, "01020304")
+  await journal.commit(3)
+  const handle = dir.files.get(`af2-${TID_CAFE}.ledger.jsonl`)
+  await appendText(handle, "{malformed\n")
+
+  assert.equal(await OpfsJournal.loadMostRecent(dir), null)
 })
 
 test("OpfsJournal init is idempotent and keeps all committed chunk bits", async () => {
   const dir = new FakeDirectoryHandle()
   const journal = new OpfsJournal()
 
-  await journal.init(dir, "cafe", 4, "01020304")
+  await journal.init(dir, TID_CAFE, LEGAL_CHUNK_SIZE, "01020304")
   await journal.commit(0)
-  await journal.init(dir, "cafe", 4, "01020304")
+  await journal.init(dir, TID_CAFE, LEGAL_CHUNK_SIZE, "01020304")
   await journal.commit(1)
 
   const loaded = await OpfsJournal.loadMostRecent(dir)
-  assert.equal(loaded.transferIdHex, "cafe")
+  assert.equal(loaded.transferIdHex, TID_CAFE)
   assert.deepEqual(loaded.completed, [0, 1])
   assert.deepEqual(Array.from(loaded.rootFrameBytes), [1, 2, 3, 4])
 })
@@ -383,11 +475,11 @@ test("OpfsJournal init is idempotent and keeps all committed chunk bits", async 
 test("OpfsJournal commit propagates failure without recording the bit", async () => {
   const dir = new FakeDirectoryHandle()
   const journal = new OpfsJournal()
-  await journal.init(dir, "writefail", 4, "01020304")
-  dir.files.get("af2-writefail.ledger.jsonl").failWritableWrite = true
+  await journal.init(dir, TID_WRITE_FAIL, LEGAL_CHUNK_SIZE, "01020304")
+  dir.files.get(`af2-${TID_WRITE_FAIL}.ledger.jsonl`).failWritableWrite = true
 
   await assert.rejects(() => journal.commit(7), /AF2_STORAGE_FATAL/)
-  dir.files.get("af2-writefail.ledger.jsonl").failWritableWrite = false
+  dir.files.get(`af2-${TID_WRITE_FAIL}.ledger.jsonl`).failWritableWrite = false
   const loaded = await OpfsJournal.loadMostRecent(dir)
   assert.deepEqual(loaded.completed, [])
 })
@@ -395,8 +487,8 @@ test("OpfsJournal commit propagates failure without recording the bit", async ()
 test("OpfsJournal retains ownership and retries a failed discard", async () => {
   const dir = new FakeDirectoryHandle()
   const journal = new OpfsJournal()
-  const name = "af2-removefail.ledger.jsonl"
-  await journal.init(dir, "removefail", 4, "01020304")
+  const name = `af2-${TID_REMOVE_FAIL}.ledger.jsonl`
+  await journal.init(dir, TID_REMOVE_FAIL, LEGAL_CHUNK_SIZE, "01020304")
   dir.failRemoveNames.add(name)
 
   await assert.rejects(() => journal.discard(), /AF2_STORAGE_FATAL/)
@@ -409,15 +501,15 @@ test("OpfsJournal retains ownership and retries a failed discard", async () => {
 test("OpfsJournal openExisting preserves root and prior commits across a second crash", async () => {
   const dir = new FakeDirectoryHandle()
   const first = new OpfsJournal()
-  await first.init(dir, "beef", 4, "aabbccdd")
+  await first.init(dir, TID_BEEF, LEGAL_CHUNK_SIZE, "aabbccdd")
   await first.commit(0)
 
   const resumed = new OpfsJournal()
-  await resumed.openExisting(dir, "beef")
+  await resumed.openExisting(dir, TID_BEEF)
   await resumed.commit(1)
 
   const loaded = await OpfsJournal.loadMostRecent(dir)
-  assert.equal(loaded.transferIdHex, "beef")
+  assert.equal(loaded.transferIdHex, TID_BEEF)
   assert.deepEqual(loaded.completed, [0, 1])
   assert.deepEqual(Array.from(loaded.rootFrameBytes), [0xaa, 0xbb, 0xcc, 0xdd])
 })

@@ -20,7 +20,7 @@
 #![cfg(feature = "jni")]
 
 use crate::sender_host::{
-    encode_chunk_balanced_packed, plan_chunks_json, parse_hash_table, NextQrError, SenderSession,
+    encode_chunk_balanced_packed, parse_hash_table, plan_chunks_json, NextQrError, SenderSession,
 };
 use af2::SenderConfig;
 use jni::objects::{JByteArray, JClass, JLongArray, JObject, JObjectArray, JString};
@@ -44,19 +44,21 @@ fn read_metas(
 ) -> Option<Vec<(u8, String, u64)>> {
     let kinds_vec = env.convert_byte_array(kinds).ok()?;
     let n = env.get_array_length(paths).ok()? as usize;
-    let mut sizes_vec = vec![0 as jlong; n];
-    env.get_long_array_region(sizes, 0, &mut sizes_vec).ok()?;
-    if kinds_vec.len() != n {
+    let sizes_len = env.get_array_length(sizes).ok()? as usize;
+    if kinds_vec.len() != n || sizes_len != n {
         throw(
             env,
             &format!(
-                "sender meta arrays disagree: kinds={}, paths={}",
+                "sender meta arrays disagree: kinds={}, paths={}, sizes={}",
                 kinds_vec.len(),
-                n
+                n,
+                sizes_len
             ),
         );
         return None;
     }
+    let mut sizes_vec = vec![0 as jlong; n];
+    env.get_long_array_region(sizes, 0, &mut sizes_vec).ok()?;
     let mut metas = Vec::with_capacity(n);
     for i in 0..n {
         let obj: JObject = env.get_object_array_element(paths, i as jint).ok()?;
@@ -182,11 +184,7 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_encodeChunkB
         Ok(d) => d,
         Err(_) => return std::ptr::null_mut(),
     };
-    let packed = encode_chunk_balanced_packed(
-        &data,
-        channel_bps.max(0) as u64,
-        force_full != 0,
-    );
+    let packed = encode_chunk_balanced_packed(&data, channel_bps.max(0) as u64, force_full != 0);
     match env.byte_array_from_slice(&packed) {
         Ok(a) => a.into_raw(),
         Err(_) => std::ptr::null_mut(),
@@ -339,6 +337,20 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_senderStageC
         throw(&mut env, "senderStageChunk on null handle");
         return 0;
     };
+    if index < 0 {
+        throw(
+            &mut env,
+            &format!("senderStageChunk has negative index {index}"),
+        );
+        return 0;
+    }
+    if !(0..=u8::MAX as jint).contains(&codec_id) {
+        throw(
+            &mut env,
+            &format!("senderStageChunk has invalid codec {codec_id}"),
+        );
+        return 0;
+    }
     let data = match env.convert_byte_array(&bytes) {
         Ok(d) => d,
         Err(_) => return 0,
@@ -347,14 +359,22 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_senderStageC
         Ok(v) => v,
         Err(_) => return 0,
     };
-    let digest = if hash_vec.len() == 32 {
-        let mut d = [0u8; 32];
-        d.copy_from_slice(&hash_vec);
-        Some(d)
-    } else {
-        None
+    let digest = match hash_vec.len() {
+        0 => None,
+        32 => {
+            let mut d = [0u8; 32];
+            d.copy_from_slice(&hash_vec);
+            Some(d)
+        }
+        len => {
+            throw(
+                &mut env,
+                &format!("senderStageChunk raw_hash must be empty or 32 bytes, got {len}"),
+            );
+            return 0;
+        }
     };
-    match session.stage_chunk(index.max(0) as u32, codec_id as u8, data, digest) {
+    match session.stage_chunk(index as u32, codec_id as u8, data, digest) {
         Ok(()) => 1,
         Err(e) => {
             throw(&mut env, &e);
@@ -396,8 +416,11 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_senderIsStag
     handle: jlong,
     index: jint,
 ) -> jboolean {
+    if index < 0 {
+        return 0;
+    }
     match session_mut(handle) {
-        Some(s) => s.is_staged(index.max(0) as u32) as jboolean,
+        Some(s) => s.is_staged(index as u32) as jboolean,
         None => 0,
     }
 }

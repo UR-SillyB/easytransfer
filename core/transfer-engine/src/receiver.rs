@@ -117,7 +117,7 @@ impl ReceiverSession {
 
     /// Ingest a frame. Returns packed status word via [`crate::ingest_status::pack`].
     pub fn ingest(&mut self, frame_bytes: &[u8]) -> u64 {
-        self.frames_seen += 1;
+        self.frames_seen = self.frames_seen.saturating_add(1);
         self.last_chunk = None;
         if !Self::root_within_host_budget(frame_bytes) {
             self.frames_corrupt = self.frames_corrupt.saturating_add(1);
@@ -172,6 +172,7 @@ impl ReceiverSession {
                 // (completed_chunks / completed_count) stays valid — canonical
                 // chunks are identical across instances. last_chunk survives so
                 // a host that has not drained it yet still can.
+                self.session_mismatch_streak = 0;
                 pack(
                     self.is_complete(),
                     true,
@@ -239,6 +240,9 @@ impl ReceiverSession {
                 )
             }
             Ok(IngestEvent::MetaRejected | IngestEvent::ChunkRejected | IngestEvent::Dropped) => {
+                // A duplicate genuine ROOT is surfaced by the core as Dropped,
+                // but it also clears the foreign-ROOT debounce candidate.
+                self.session_mismatch_streak = self.inner.mismatch_streak();
                 pack(
                     self.is_complete(),
                     false,
@@ -324,12 +328,12 @@ impl ReceiverSession {
     /// Returns false (leaving the session untouched) when the stored ROOT fails
     /// the full parse + id-binding path.
     pub fn resume(&mut self, root_frame_bytes: &[u8], completed: &[u32]) -> bool {
-        self.final_verifier = None;
         if !Self::root_within_host_budget(root_frame_bytes) {
             return false;
         }
         match self.inner.resume(root_frame_bytes, completed) {
             Ok(accepted) => {
+                self.final_verifier = None;
                 // Only indices actually inside the transfer count (af2 drops
                 // out-of-range entries silently — the ledger must not).  In a
                 // late-resume merge `accepted` is only the number NEWLY added
@@ -737,6 +741,28 @@ mod tests {
     }
 
     #[test]
+    fn genuine_root_clears_packed_foreign_streak() {
+        let mut current = Af2Sender::new(
+            vec![(KIND_FILE, "current.bin".to_string(), vec![1u8; 1000])],
+            SenderConfig::default(),
+        )
+        .unwrap();
+        let mut foreign = Af2Sender::new(
+            vec![(KIND_FILE, "foreign.bin".to_string(), vec![2u8; 1000])],
+            SenderConfig::default(),
+        )
+        .unwrap();
+        let current_root = current.next_frame().unwrap();
+        let foreign_root = foreign.next_frame().unwrap();
+        let mut session = ReceiverSession::new();
+        let _ = session.ingest(&current_root);
+        assert_eq!((session.ingest(&foreign_root) >> 8) & 0xFFFF, 1);
+        assert_eq!((session.ingest(&foreign_root) >> 8) & 0xFFFF, 2);
+        assert_eq!((session.ingest(&current_root) >> 8) & 0xFFFF, 0);
+        assert_eq!((session.ingest(&foreign_root) >> 8) & 0xFFFF, 1);
+    }
+
+    #[test]
     fn duplicate_symbol_does_not_inflate_received_or_rate_counters() {
         let mut state = 0x1234_5678u64;
         let data: Vec<u8> = (0..64 << 10)
@@ -770,6 +796,14 @@ mod tests {
         assert_eq!(session.frames_duplicate, duplicates + 1);
         assert_eq!((word >> 32) as u32, received);
         assert_eq!(word >> 1 & 1, 0, "duplicate must not set accepted");
+    }
+
+    #[test]
+    fn frame_counter_saturates_on_unbounded_input() {
+        let mut session = ReceiverSession::new();
+        session.frames_seen = u64::MAX;
+        let _ = session.ingest(b"not an AF2 frame");
+        assert_eq!(session.frames_seen, u64::MAX);
     }
 
     #[test]
@@ -974,6 +1008,40 @@ mod tests {
         bad[n - 5] ^= 0xFF;
         let mut fresh = ReceiverSession::new();
         assert!(!fresh.resume(&bad, &[0]));
+    }
+
+    #[test]
+    fn failed_resume_preserves_active_final_verifier() {
+        let data = vec![0x77u8; 2500];
+        let mut sender = Af2Sender::new(
+            vec![(KIND_FILE, "verify.bin".to_string(), data.clone())],
+            SenderConfig::default(),
+        )
+        .unwrap();
+        let root_frame = sender.next_frame().unwrap();
+        let mut session = ReceiverSession::new();
+        let _ = session.ingest(&root_frame);
+        let mut manifest_ready = false;
+        for _ in 0..4000 {
+            if bits(session.ingest(&sender.next_frame().unwrap())).2 {
+                manifest_ready = true;
+                break;
+            }
+        }
+        assert!(manifest_ready);
+        assert!(session.final_verify_begin());
+        assert!(session.final_verify_feed(&data[..100]));
+
+        let mut bad_root = root_frame;
+        let last_body_byte = bad_root.len() - 5;
+        bad_root[last_body_byte] ^= 0xFF;
+        assert!(!session.resume(&bad_root, &[]));
+        assert!(
+            session.final_verifier.is_some(),
+            "a rejected resume must leave the session untouched"
+        );
+        assert!(session.final_verify_feed(&data[100..]));
+        assert!(session.final_verify_finish());
     }
 
     #[test]

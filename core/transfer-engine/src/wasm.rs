@@ -63,6 +63,9 @@ pub struct SenderBuilderWasm {
     /// cross into the core at build time — only at play time, chunk by
     /// chunk, via `SenderSessionWasm::stage_chunk`.
     metas: Vec<(u8, String, u64, [u8; 32])>,
+    /// Metadata-only cache probe entries. Kept separate from `metas` so the
+    /// zero hash placeholders can never be consumed by `build_streamed`.
+    cached_metas: Vec<(u8, String, u64)>,
     chunk_hashes: Vec<[u8; 32]>,
 }
 
@@ -72,12 +75,30 @@ impl Default for SenderBuilderWasm {
     }
 }
 
-fn hash32(bytes: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    if bytes.len() == 32 {
-        out.copy_from_slice(bytes);
+fn hash32(bytes: &[u8], field: &str) -> Result<[u8; 32], JsValue> {
+    if bytes.len() != 32 {
+        return Err(JsValue::from_str(&format!(
+            "AF2 {field} must be exactly 32 bytes, got {}",
+            bytes.len()
+        )));
     }
-    out
+    let mut out = [0u8; 32];
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
+fn checked_entry_size(size: f64) -> Result<u64, JsValue> {
+    if !size.is_finite()
+        || size < 0.0
+        || size.fract() != 0.0
+        || size > af2::root::MAX_TOTAL_RAW_SIZE as f64
+    {
+        return Err(JsValue::from_str(&format!(
+            "AF2 entry size must be an integer in 0..={}, got {size}",
+            af2::root::MAX_TOTAL_RAW_SIZE
+        )));
+    }
+    Ok(size as u64)
 }
 
 #[wasm_bindgen]
@@ -88,6 +109,7 @@ impl SenderBuilderWasm {
             items: Vec::new(),
             preencoded: Vec::new(),
             metas: Vec::new(),
+            cached_metas: Vec::new(),
             chunk_hashes: Vec::new(),
         }
     }
@@ -100,18 +122,41 @@ impl SenderBuilderWasm {
     /// the content (computed by the host with [`Blake3Wasm`] while streaming).
     /// `size` is an f64 only because JS numbers are doubles — values up to
     /// 2^53 (well past the 4 TiB wire ceiling) round-trip exactly.
-    pub fn add_meta(&mut self, kind: u8, path: &str, size: f64, content_hash: &[u8]) {
+    pub fn add_meta(
+        &mut self,
+        kind: u8,
+        path: &str,
+        size: f64,
+        content_hash: &[u8],
+    ) -> Result<(), JsValue> {
         self.metas.push((
             kind,
             path.to_string(),
-            size.max(0.0) as u64,
-            hash32(content_hash),
+            checked_entry_size(size)?,
+            hash32(content_hash, "content hash")?,
         ));
+        Ok(())
+    }
+
+    /// Cache-hit entry geometry. Content hashes are deliberately absent in
+    /// the metadata-only probe; the cached Manifest supplies them, while
+    /// [`Self::build_streamed_cached`] still binds kind/path/size exactly.
+    pub fn add_cached_meta(
+        &mut self,
+        kind: u8,
+        path: &str,
+        size: f64,
+    ) -> Result<(), JsValue> {
+        self.cached_metas
+            .push((kind, path.to_string(), checked_entry_size(size)?));
+        Ok(())
     }
 
     /// One BLAKE3-256 per canonical chunk, position-indexed (streamed build).
-    pub fn add_chunk_hash(&mut self, chunk_hash: &[u8]) {
-        self.chunk_hashes.push(hash32(chunk_hash));
+    pub fn add_chunk_hash(&mut self, chunk_hash: &[u8]) -> Result<(), JsValue> {
+        self.chunk_hashes
+            .push(hash32(chunk_hash, "chunk hash")?);
+        Ok(())
     }
 
     /// Provision one pre-encoded chunk (see [`af2::chunk::encode_chunk_balanced`]).
@@ -198,6 +243,11 @@ impl SenderBuilderWasm {
         chunk_raw_size: u32,
         redundancy_pct: u8,
     ) -> Result<SenderSessionWasm, JsValue> {
+        if !self.cached_metas.is_empty() {
+            return Err(JsValue::from_str(
+                "AF2 cache-only metadata cannot build a fresh streamed manifest",
+            ));
+        }
         let manifest = af2::manifest::build_manifest_from_hashes(
             self.metas.drain(..),
             chunk_raw_size,
@@ -233,7 +283,20 @@ impl SenderBuilderWasm {
             chunk_raw_size,
             redundancy_pct,
         };
-        let inner = Af2Sender::from_manifest_streamed(manifest, config)
+        if !self.metas.is_empty() && !self.cached_metas.is_empty() {
+            return Err(JsValue::from_str(
+                "AF2 cached sender metadata modes cannot be mixed",
+            ));
+        }
+        let items = if self.cached_metas.is_empty() {
+            self.metas
+                .into_iter()
+                .map(|(kind, path, size, _)| (kind, path, size))
+                .collect()
+        } else {
+            self.cached_metas
+        };
+        let inner = Af2Sender::from_manifest_streamed_checked(manifest, items, config)
             .map_err(|e| JsValue::from_str(&format!("AF2 streamed sender build failed: {e}")))?;
         Ok(SenderSessionWasm::from_inner(inner))
     }
@@ -316,8 +379,8 @@ impl SenderSessionWasm {
                     )))
                 }
             };
-            self.frames_emitted += 1;
-            self.bytes_emitted += frame_bytes.len() as u64;
+            self.frames_emitted = self.frames_emitted.saturating_add(1);
+            self.bytes_emitted = self.bytes_emitted.saturating_add(frame_bytes.len() as u64);
             let matrix = qr_protocol::qr_render::encode(&frame_bytes)
                 .map_err(|e| JsValue::from_str(&format!("qr encode failed: {e:?}")))?;
             let need = 4 + matrix.modules.len();
@@ -588,20 +651,23 @@ pub fn plan_chunks(
             "plan_chunks: kinds/paths/sizes length mismatch",
         ));
     }
-    // f64→u64 must be checked before the cast (§3 checked arithmetic).
-    const MAX_TOTAL: f64 = 4.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    // f64→u64 must be checked before the cast (§3 checked arithmetic). A
+    // fractional size is invalid too: truncating it here would make the host
+    // read/hash different chunk boundaries from the later Manifest build.
+    let mut checked_sizes = Vec::with_capacity(sizes.len());
     for (i, &s) in sizes.iter().enumerate() {
-        if !(s.is_finite() && s >= 0.0 && s <= MAX_TOTAL) {
+        let Ok(size) = checked_entry_size(s) else {
             return Err(JsValue::from_str(&format!(
                 "plan_chunks: item {i} size {s} out of range"
             )));
-        }
+        };
+        checked_sizes.push(size);
     }
     let metas: Vec<(u8, String, u64)> = kinds
         .into_iter()
         .zip(paths)
-        .zip(sizes)
-        .map(|((k, p), s)| (k, p, s as u64))
+        .zip(checked_sizes)
+        .map(|((k, p), s)| (k, p, s))
         .collect();
     let chunks = af2_plan_chunks(&metas, chunk_raw_size)
         .map_err(|e| JsValue::from_str(&format!("plan_chunks failed: {e}")))?;

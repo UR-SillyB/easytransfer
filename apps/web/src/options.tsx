@@ -423,6 +423,13 @@ export default function App() {
         }
         return builder
       }
+      const buildFromCachedMeta = () => {
+        const builder = new SenderBuilderWasm()
+        for (const en of p.entries) {
+          builder.add_cached_meta(en.kind, en.path, en.size)
+        }
+        return builder
+      }
       let session: SenderSessionWasm | null = null
       if (p.cachedManifestHex) {
         // Probe-phase cache hit: the worker already skipped the content
@@ -430,7 +437,7 @@ export default function App() {
         // once with cache bypass rather than attempting to build from the
         // probe's intentionally-empty hash placeholders.
         try {
-          session = new SenderBuilderWasm().build_streamed_cached(
+          session = buildFromCachedMeta().build_streamed_cached(
             p.cachedManifestHex,
             cfg.symbolSize,
             chunkRawSize,

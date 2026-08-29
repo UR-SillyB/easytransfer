@@ -5,9 +5,16 @@ import fs from "node:fs"
 import path from "node:path"
 
 const [,, dir, crt, key, portArg] = process.argv
-const port = Number(portArg) || 8765
+const requestedPort = portArg === undefined ? 8765 : Number(portArg)
+const port = Number.isInteger(requestedPort) && requestedPort >= 1 && requestedPort <= 65535
+  ? requestedPort
+  : NaN
 if (!dir || !crt || !key) {
   console.error("usage: node serve-https.mjs <serveDir> <crt> <key> [port]")
+  process.exit(1)
+}
+if (!Number.isInteger(port)) {
+  console.error(`invalid port: ${portArg}`)
   process.exit(1)
 }
 
@@ -18,21 +25,44 @@ const types = {
   ".css": "text/css",
   ".png": "image/png",
 }
+const root = fs.realpathSync(dir)
 
 const server = https.createServer(
   { cert: fs.readFileSync(crt), key: fs.readFileSync(key) },
   (req, res) => {
-    const urlPath = decodeURIComponent((req.url || "/").split("?")[0])
-    const filePath = path.resolve(dir, urlPath === "/" ? "receiver.html" : urlPath)
+    let urlPath
+    try {
+      urlPath = decodeURIComponent((req.url || "/").split("?")[0])
+    } catch {
+      res.writeHead(400); res.end("bad request"); return
+    }
+    // Request targets begin with '/'. Passing that directly to path.resolve
+    // discards `root`, so normalize it to a relative path first.
+    const relativePath = urlPath === "/"
+      ? "receiver.html"
+      : urlPath.replace(/^[/\\]+/, "")
+    const candidatePath = path.resolve(root, relativePath)
     // Boundary-aware containment: a plain startsWith(dir) also admits sibling
     // directories that share the prefix (e.g. dist vs dist-standalone).
-    const root = path.resolve(dir)
+    let filePath = candidatePath
+    let isFile = false
+    try {
+      filePath = fs.realpathSync(candidatePath)
+      isFile = fs.statSync(filePath).isFile()
+    } catch { /* missing/raced */ }
+    // Recheck after resolving symlinks so a link within the served tree cannot
+    // expose an arbitrary file elsewhere on the machine.
     const contained = filePath === root || filePath.startsWith(root + path.sep)
-    if (!contained || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+    if (!contained || !isFile) {
       res.writeHead(404); res.end("not found"); return
     }
     res.writeHead(200, { "content-type": types[path.extname(filePath)] || "application/octet-stream" })
-    fs.createReadStream(filePath).pipe(res)
+    const stream = fs.createReadStream(filePath)
+    stream.on("error", () => {
+      if (!res.headersSent) res.writeHead(500)
+      res.end()
+    })
+    stream.pipe(res)
   }
 )
 

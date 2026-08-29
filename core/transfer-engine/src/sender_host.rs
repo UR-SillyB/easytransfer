@@ -49,12 +49,9 @@ impl SenderSession {
         config: SenderConfig,
         chunk_hashes: Vec<[u8; 32]>,
     ) -> Result<Self, String> {
-        let manifest = af2::manifest::build_manifest_from_hashes(
-            metas,
-            config.chunk_raw_size,
-            chunk_hashes,
-        )
-        .map_err(|e| format!("AF2 streamed manifest build failed: {e}"))?;
+        let manifest =
+            af2::manifest::build_manifest_from_hashes(metas, config.chunk_raw_size, chunk_hashes)
+                .map_err(|e| format!("AF2 streamed manifest build failed: {e}"))?;
         let inner = Af2Sender::from_manifest_streamed(manifest, config)
             .map_err(|e| format!("AF2 streamed sender build failed: {e}"))?;
         Ok(Self {
@@ -107,8 +104,8 @@ impl SenderSession {
                     )));
                 }
             };
-            self.frames_emitted += 1;
-            self.bytes_emitted += frame_bytes.len() as u64;
+            self.frames_emitted = self.frames_emitted.saturating_add(1);
+            self.bytes_emitted = self.bytes_emitted.saturating_add(frame_bytes.len() as u64);
             let matrix = qr_protocol::qr_render::encode(&frame_bytes)
                 .map_err(|e| NextQrError::Failed(format!("qr encode failed: {e:?}")))?;
             debug_assert!(matrix.size <= MAX_QR_SIDE_MODULES);
@@ -239,7 +236,12 @@ mod tests {
         assert_eq!(json, format!("{{\"chunks\":[[0,0,{}]]}}", content.len()));
         let chunk_hashes = vec![hash32(content)];
         let session = SenderSession::new_streamed(
-            vec![(KIND_UTF8_TEXT, "msg.txt".to_string(), content.len() as u64, hash32(content))],
+            vec![(
+                KIND_UTF8_TEXT,
+                "msg.txt".to_string(),
+                content.len() as u64,
+                hash32(content),
+            )],
             SenderConfig {
                 symbol_size: 512,
                 chunk_raw_size: 8 * 1024 * 1024,

@@ -20,8 +20,8 @@
 //! 108  4    chunk_raw_size
 //! ```
 
-use crate::id::{transfer_id, EntryIdInput};
 use crate::id::content_id as compute_content_id;
+use crate::id::{transfer_id, EntryIdInput};
 
 pub const ROOT_MAGIC: &[u8; 4] = b"AFR2";
 pub const ROOT_SCHEMA: u8 = 1;
@@ -83,6 +83,13 @@ pub enum RootError {
 /// canonical stream must be non-empty (`total_raw_size ≥ 1` is enforced by
 /// encode/parse), so the ceil is always ≥ 1 on any legal ROOT.
 pub fn expected_chunk_count(total_raw_size: u64, chunk_raw_size: u32) -> u32 {
+    // Keep this public helper total even for a bad caller. Protocol encode /
+    // parse paths reject zero as BadChunkSize before using the result, but a
+    // direct call must not turn a configuration error into a divide-by-zero
+    // panic (workspace release builds use panic=abort).
+    if chunk_raw_size == 0 {
+        return u32::MAX;
+    }
     u32::try_from(total_raw_size.div_ceil(u64::from(chunk_raw_size))).unwrap_or(u32::MAX)
 }
 
@@ -219,6 +226,12 @@ mod tests {
     }
 
     #[test]
+    fn expected_chunk_count_is_total_for_zero_chunk_size() {
+        assert_eq!(expected_chunk_count(0, 0), u32::MAX);
+        assert_eq!(expected_chunk_count(1, 0), u32::MAX);
+    }
+
+    #[test]
     fn rejects_violations() {
         let mut r = sample();
         r.chunk_count = 3; // inconsistent with total/chunk
@@ -239,7 +252,10 @@ mod tests {
         // tampered magic
         let mut bytes = sample().encode().unwrap();
         bytes[0] = b'X';
-        assert!(matches!(RootRecord::parse(&bytes), Err(RootError::BadMagic)));
+        assert!(matches!(
+            RootRecord::parse(&bytes),
+            Err(RootError::BadMagic)
+        ));
         // v1 ET descriptor body must not parse as ROOT
         assert!(matches!(
             RootRecord::parse(&[0xD5u8, 5, 0, 0]),

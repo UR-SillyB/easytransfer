@@ -172,6 +172,15 @@ function readMetaCached(s: ReceiverSessionWasm, force = false): MetaInfo {
   return meta
 }
 
+async function discardResumeCandidate(
+  dir: FileSystemDirectoryHandle | null,
+  transferIdHex: string
+): Promise<void> {
+  if (!dir) return
+  try { await dir.removeEntry(`af2-${transferIdHex}.ledger.jsonl`) } catch {}
+  try { await dir.removeEntry(`af2-${transferIdHex}.partial`) } catch {}
+}
+
 async function tryResume(): Promise<void> {
   if (resumeChecked || (session && session.is_complete())) return
   resumeChecked = true
@@ -188,18 +197,30 @@ async function tryResume(): Promise<void> {
       // Structurally valid JSON can still carry a semantically invalid ROOT.
       // Remove only this unusable candidate, then fall back to the next older
       // valid journal instead of letting it mask every other resumable task.
-      if (dir) {
-        try { await dir.removeEntry(`af2-${latest.transferIdHex}.ledger.jsonl`) } catch {}
-        try { await dir.removeEntry(`af2-${latest.transferIdHex}.partial`) } catch {}
-      }
+      await discardResumeCandidate(dir, latest.transferIdHex)
       continue
     }
+    const resumedMeta = readMetaCached(session, true)
+    if (
+      resumedMeta.transferIdHex !== latest.transferIdHex ||
+      resumedMeta.chunkRawSize !== latest.chunkRawSize
+    ) {
+      // The filename/header pair is only a storage hint. The ROOT is the
+      // authority for transfer identity and geometry; never let a forged
+      // header bind storage owned by a different ROOT.
+      try { session.free() } catch {}
+      session = null
+      invalidateMetaCache()
+      await discardResumeCandidate(dir, latest.transferIdHex)
+      continue
+    }
+    const completed = latest.completed.filter((index) => index < resumedMeta.chunkCount)
     // Resume must not create an empty .partial file when the durable backing
     // file has disappeared; reverification below invalidates missing bits so
     // the sender can re-supply exactly those chunks.
     await chunkStore.init(dir, latest.transferIdHex, { create: false })
-    chunkStore.markResumed(latest.completed)
-    pendingReverify = new Set(latest.completed)
+    chunkStore.markResumed(completed)
+    pendingReverify = new Set(completed)
     // Rebind without truncating the valid root header / prior commit records.
     await journal.openExisting(dir, latest.transferIdHex)
     return
@@ -479,6 +500,7 @@ self.addEventListener("message", (e: MessageEvent) => {
 async function handleMessage(data: Record<string, unknown>): Promise<void> {
 
   if (data.type === "init") {
+    activeJobId = typeof data.jobId === "number" ? data.jobId : 0
     try {
       await ensureWasm()
       await dropSession()
@@ -486,7 +508,6 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
       // reference it lazily); sweep only old ledger-less backings.
       await sweepOrphanPartials(await getOpfsDir())
       resumeChecked = false
-      activeJobId = typeof data.jobId === "number" ? data.jobId : 0
       post({ type: "ready", jobId: activeJobId })
       post({ type: "init_ok", jobId: activeJobId })
     } catch (err) {
@@ -544,6 +565,8 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
   }
 
   if (data.type === "assemble") {
+    const jobId = typeof data.jobId === "number" ? data.jobId : activeJobId
+    if (jobId !== activeJobId) return
     if (!session) return
     try {
       const meta = readMetaCached(session, true)
@@ -552,7 +575,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
           post({
             type: "error",
             message: `分块 ${i + 1}/${meta.chunkCount} 缺失，无法组装`,
-            jobId: activeJobId,
+            jobId,
           })
           return
         }
@@ -592,7 +615,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
         post({
           type: "resupply",
           message: `检测到 ${badChunks.length} 个本地损坏/缺失分块，正在等待发送端重供…`,
-          jobId: activeJobId,
+          jobId,
         })
         return
       }
@@ -600,7 +623,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
         post({
           type: "error",
           message: "传输终验失败：条目哈希、UTF-8 或 Content ID 校验未通过",
-          jobId: activeJobId,
+          jobId,
         })
         return
       }
@@ -672,13 +695,13 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
       post({
         type: "result",
         recovered,
-        jobId: activeJobId,
+        jobId,
       })
     } catch (err) {
       post({
         type: "error",
         message: `组装失败: ${err instanceof Error ? err.message : String(err)}`,
-        jobId: activeJobId,
+        jobId,
       })
     }
   }

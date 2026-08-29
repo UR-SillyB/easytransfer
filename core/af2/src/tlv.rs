@@ -43,7 +43,7 @@ pub const TLV_UNIX_MODE: u16 = 0x0102;
 pub const TLV_MIME: u16 = 0x0103;
 pub const TLV_TYPE_CLASS: u16 = 0x0104;
 
-/// Encode one scope's TLV list (must already be ascending + unique).
+/// Encode one scope's TLV list, rejecting non-canonical ordering or duplicates.
 ///
 /// Fails loudly when a value or the whole scope area does not fit the u16
 /// fields of the wire format — a silent `as u16` truncation would emit
@@ -51,13 +51,23 @@ pub const TLV_TYPE_CLASS: u16 = 0x0104;
 /// BodyLenMismatch.
 pub fn encode_tlvs(tlvs: &[Tlv]) -> Result<Vec<u8>, TlvError> {
     let mut out = Vec::new();
+    let mut prev_type: Option<u16> = None;
     for t in tlvs {
+        if let Some(prev) = prev_type {
+            if t.type_id <= prev {
+                return Err(TlvError::NotAscending {
+                    prev,
+                    got: t.type_id,
+                });
+            }
+        }
         if t.value.len() > u16::MAX as usize {
             return Err(TlvError::ValueTooLarge { len: t.value.len() });
         }
         out.extend_from_slice(&t.type_id.to_be_bytes());
         out.extend_from_slice(&(t.value.len() as u16).to_be_bytes());
         out.extend_from_slice(&t.value);
+        prev_type = Some(t.type_id);
     }
     if out.len() > u16::MAX as usize {
         return Err(TlvError::ScopeTooLarge { len: out.len() });
@@ -115,8 +125,14 @@ mod tests {
     #[test]
     fn round_trip() {
         let tlvs = vec![
-            Tlv { type_id: TLV_MTIME_MS, value: 12345u64.to_be_bytes().to_vec() },
-            Tlv { type_id: TLV_MIME, value: b"text/plain".to_vec() },
+            Tlv {
+                type_id: TLV_MTIME_MS,
+                value: 12345u64.to_be_bytes().to_vec(),
+            },
+            Tlv {
+                type_id: TLV_MIME,
+                value: b"text/plain".to_vec(),
+            },
         ];
         let bytes = encode_tlvs(&tlvs).unwrap();
         assert_eq!(parse_tlvs(&bytes).unwrap(), tlvs);
@@ -125,7 +141,10 @@ mod tests {
     #[test]
     fn oversize_value_and_scope_fail_loudly() {
         // A single value past the u16 length field must error, not truncate.
-        let big = Tlv { type_id: TLV_MIME, value: vec![0u8; u16::MAX as usize + 1] };
+        let big = Tlv {
+            type_id: TLV_MIME,
+            value: vec![0u8; u16::MAX as usize + 1],
+        };
         assert!(matches!(
             encode_tlvs(&[big]),
             Err(TlvError::ValueTooLarge { .. })
@@ -146,23 +165,49 @@ mod tests {
 
     #[test]
     fn rejects_descending_and_duplicate_and_truncated() {
-        let bad = encode_tlvs(&[
-            Tlv { type_id: TLV_MIME, value: vec![] },
-            Tlv { type_id: TLV_MTIME_MS, value: vec![] }, // descending
-        ])
-        .unwrap();
+        let descending = [
+            Tlv {
+                type_id: TLV_MIME,
+                value: vec![],
+            },
+            Tlv {
+                type_id: TLV_MTIME_MS,
+                value: vec![],
+            }, // descending
+        ];
+        assert!(matches!(
+            encode_tlvs(&descending),
+            Err(TlvError::NotAscending { .. })
+        ));
+        let bad = [0x01, 0x03, 0, 0, 0x01, 0x01, 0, 0];
         assert!(matches!(
             parse_tlvs(&bad),
             Err(TlvError::NotAscending { .. })
         ));
-        let dup = encode_tlvs(&[
-            Tlv { type_id: TLV_MIME, value: vec![] },
-            Tlv { type_id: TLV_MIME, value: vec![] },
-        ])
-        .unwrap();
-        assert!(matches!(parse_tlvs(&dup), Err(TlvError::NotAscending { .. })));
-        let truncated = &encode_tlvs(&[Tlv { type_id: TLV_MIME, value: vec![1, 2, 3] }])
-            .unwrap()[..5];
+        let duplicate = [
+            Tlv {
+                type_id: TLV_MIME,
+                value: vec![],
+            },
+            Tlv {
+                type_id: TLV_MIME,
+                value: vec![],
+            },
+        ];
+        assert!(matches!(
+            encode_tlvs(&duplicate),
+            Err(TlvError::NotAscending { .. })
+        ));
+        let dup = [0x01, 0x03, 0, 0, 0x01, 0x03, 0, 0];
+        assert!(matches!(
+            parse_tlvs(&dup),
+            Err(TlvError::NotAscending { .. })
+        ));
+        let truncated = &encode_tlvs(&[Tlv {
+            type_id: TLV_MIME,
+            value: vec![1, 2, 3],
+        }])
+        .unwrap()[..5];
         assert!(matches!(
             parse_tlvs(truncated),
             Err(TlvError::TruncatedHeader { .. }) | Err(TlvError::ValueOverflow { .. })
@@ -171,15 +216,19 @@ mod tests {
 
     #[test]
     fn unknown_critical_fail_closed() {
-        let tlvs = vec![Tlv { type_id: 0x8001, value: vec![] }];
+        let tlvs = vec![Tlv {
+            type_id: 0x8001,
+            value: vec![],
+        }];
         assert!(matches!(
             check_unknown_critical(&tlvs),
             Err(TlvError::UnknownCritical { .. })
         ));
         // Known optional types pass.
-        assert!(check_unknown_critical(&[
-            Tlv { type_id: TLV_MTIME_MS, value: vec![] }
-        ])
+        assert!(check_unknown_critical(&[Tlv {
+            type_id: TLV_MTIME_MS,
+            value: vec![]
+        }])
         .is_ok());
     }
 }

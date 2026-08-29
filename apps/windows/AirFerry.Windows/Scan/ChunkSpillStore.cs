@@ -106,6 +106,11 @@ public sealed class ChunkSpillStore : IDisposable
         {
             return null;
         }
+        // The cached read/write stream is left at the end of the most recent
+        // pwrite. Whole-stream recovery must explicitly rewind; otherwise a
+        // same-process completion reads EOF and incorrectly falls back to
+        // native chunks that may already have been evicted.
+        fs.Seek(0, SeekOrigin.Begin);
         var buf = new byte[totalRawSize];
         int done = 0;
         while (done < buf.Length)
@@ -234,7 +239,7 @@ public sealed class ChunkSpillStore : IDisposable
         {
             return null;
         }
-        if (offset + size > fs.Length)
+        if (offset > fs.Length || size > fs.Length - offset)
         {
             return null;
         }

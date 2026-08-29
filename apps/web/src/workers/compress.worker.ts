@@ -277,6 +277,7 @@ async function runPrepare(
   }
   try {
     await ensureWasm()
+    if (latestPrepareJob !== jobId) return
 
     const sources: ItemSource[] = []
     const metas: { kind: number; path: string; size: number; fingerprint: string }[] = []
@@ -614,12 +615,23 @@ self.addEventListener("message", (e: MessageEvent) => {
     name?: string
     encodeParams?: EncodeParams
   }
-  const params: EncodeParams = encodeParams ?? { channelBps: 0, forceFull: false }
+  const requestedBps = Number(encodeParams?.channelBps ?? 0)
+  const params: EncodeParams = {
+    channelBps: Number.isFinite(requestedBps)
+      ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(requestedBps)))
+      : 0,
+    forceFull: encodeParams?.forceFull === true,
+  }
 
   // Respond immediately so the UI flips to "reading" without waiting behind
   // a still-running older pass; the pass itself is serialized.
   post({ phase: "reading", jobId })
   latestPrepareJob = jobId
+  if (pendingContinue && pendingContinue.jobId !== jobId) {
+    const resolve = pendingContinue.resolve
+    pendingContinue = null
+    resolve(false)
+  }
   prepareChain = prepareChain.then(() =>
     runPrepare(jobId, files, text, name, params)
   )

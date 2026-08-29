@@ -1,14 +1,14 @@
 {
   "version": 2,
-  "state_revision": 18,
-  "archive_revision": "sha256:7c57348b0a4a69a903f91e639898ff4b39320fdc8bbee94c111eb1f3786e51f9",
-  "generated_at": "unix:1787128117",
+  "state_revision": 20,
+  "archive_revision": "sha256:b6c5382c0818b610f06daf36926b1abd7b35d029894c48dd00a2dcb99c469e6e",
+  "generated_at": "unix:1787625593",
   "current_session": {
-    "number": 6,
-    "path": "docs/history-session/6.md",
+    "number": 7,
+    "path": "docs/history-session/7.md",
     "reason": "当前 ChatGPT 会话档案"
   },
-  "current_focus": "帮我改了",
+  "current_focus": "# Overview\n\nGenerate 0 to 3 hyperpersonalized suggestions for what this user can do with Codex in this local project: /Users/yingbiao/code/AirFerry\n\nGet an understanding of the user's intent and goals by deeply viewing their connected apps. Suggest actionable tasks that they would actually act on/click.",
   "recent_changes": [
     "apps/web/src/lib/chunk-stager.ts",
     "apps/web/test/chunk-stager.test.mjs",
@@ -24,6 +24,7 @@
     "apps/web/src/types.ts"
   ],
   "open_items": [
+    "Offer only concrete follow-ups directly related to the current CI cache fix and recent streamed-sender validation changes.",
     "Change ChunkStager to prefetch only wrapped next after reconciling armed state; keep single-chunk behavior via next == cur and add a bounded-staged-count regression.",
     "Restore fail-closed compressed stage validation: precomputed digest path for all codecs; decode+hash fallback when no digest is provided; send/store compressed rawHash in Web worker.",
     "Implement invalid-cache recovery that invalidates the cache entry and reruns the full read/hash/encode pass rather than attempting metadata-only rebuild.",
@@ -34,10 +35,14 @@
     "Track Y-plane ownership by generation+qrSlot and release only matching ownership; release the reserved slot on worker fatal error; add lifecycle regression tests.",
     "Move resend-cache lookup before the expensive prepare pass when possible, or validate cached Manifest against current computed hashes and auto-rebuild on mismatch.",
     "Move staged-chunk verification off the render/main thread or pass a trusted prepare-time verification token/digest so playback only does bounded cheap validation.",
-    "Prioritize Android cleanup/recovery mutual exclusion and Y-plane session ownership for correctness, then single-chunk epoch stalling, cache semantics, and stage_chunk main-thread performance.",
-    "Regenerate apps/web/wasm-pkg before testing/packaging so the core/af2 sender validation source changes are present in the browser WASM binary. Standard scripts/build-all.sh already invokes npm run wasm first; direct npm run build requires npm run wasm beforehand."
+    "Prioritize Android cleanup/recovery mutual exclusion and Y-plane session ownership for correctness, then single-chunk epoch stalling, cache semantics, and stage_chunk main-thread performance."
   ],
   "references": [
+    {
+      "number": 6,
+      "path": "docs/history-session/6.md",
+      "reason": "最近历史档案；可按需读取原文"
+    },
     {
       "number": 5,
       "path": "docs/history-session/5.md",

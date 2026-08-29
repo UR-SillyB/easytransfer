@@ -50,10 +50,18 @@ pub fn build_manifest_from_hashes(
     chunk_hashes: Vec<[u8; 32]>,
 ) -> Result<Manifest, ManifestError> {
     use unicode_normalization::UnicodeNormalization;
+    if !crate::root::CHUNK_SIZES.contains(&chunk_raw_size) {
+        return Err(ManifestError::BadChunkSize(chunk_raw_size));
+    }
     let mut items: Vec<(u8, String, u64, [u8; 32])> = items
         .into_iter()
         .map(|(kind, path, size, digest)| (kind, path.nfc().collect(), size, digest))
         .collect();
+    if items.len() > MAX_ENTRIES {
+        return Err(ManifestError::TooManyEntries(
+            u32::try_from(items.len()).unwrap_or(u32::MAX),
+        ));
+    }
     items.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
 
     let mut entries = Vec::with_capacity(items.len());
@@ -73,10 +81,12 @@ pub fn build_manifest_from_hashes(
             (0, 0, empty_hash())
         } else {
             let offset = stream_end;
-            stream_end = stream_end.checked_add(size).ok_or(ManifestError::BadEntry {
-                index: entries.len(),
-                reason: "canonical stream size overflow",
-            })?;
+            stream_end = stream_end
+                .checked_add(size)
+                .ok_or(ManifestError::BadEntry {
+                    index: entries.len(),
+                    reason: "canonical stream size overflow",
+                })?;
             (offset, size, digest)
         };
         entries.push(ManifestEntry {
@@ -90,6 +100,9 @@ pub fn build_manifest_from_hashes(
     }
     if stream_end == 0 {
         return Err(ManifestError::EmptyStream);
+    }
+    if stream_end > crate::root::MAX_TOTAL_RAW_SIZE {
+        return Err(ManifestError::TotalTooLarge(stream_end));
     }
     let chunk_count = crate::root::expected_chunk_count(stream_end, chunk_raw_size);
     if chunk_hashes.len() != chunk_count as usize {
@@ -143,6 +156,10 @@ pub enum ManifestError {
     BadChunkSize(u32),
     #[error("manifest: total_raw_size must be ≥ 1 (empty canonical stream is unrepresentable)")]
     EmptyStream,
+    #[error("manifest: total_raw_size {0} exceeds 4 TiB")]
+    TotalTooLarge(u64),
+    #[error("manifest: chunk_count {0} exceeds 131072")]
+    ChunkCountTooLarge(u32),
     #[error("manifest: exceeds 16 MiB cap ({0} bytes)")]
     TooLarge(usize),
     #[error("manifest: entry {index}: {reason}")]
@@ -152,7 +169,11 @@ pub enum ManifestError {
     #[error("manifest: duplicate path {path:?}")]
     DuplicatePath { path: String },
     #[error("manifest: content stream gap at entry {index}: offset {offset}, expected {expected}")]
-    StreamGap { index: usize, offset: u64, expected: u64 },
+    StreamGap {
+        index: usize,
+        offset: u64,
+        expected: u64,
+    },
     #[error("manifest: stream end {end} != total_raw_size {total}")]
     StreamEndMismatch { end: u64, total: u64 },
     #[error("manifest: truncated while reading {what}")]
@@ -233,7 +254,13 @@ fn is_windows_reserved_name(comp: &str) -> bool {
 fn sanitize_component_windows(comp: &str) -> String {
     let mut out: String = comp
         .chars()
-        .map(|c| if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') { '_' } else { c })
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     if is_windows_reserved_name(&out) {
         // Windows applies the device-name rule to the stem even when an
@@ -343,6 +370,9 @@ impl Manifest {
         if self.total_raw_size == 0 {
             return Err(ManifestError::EmptyStream);
         }
+        if self.total_raw_size > crate::root::MAX_TOTAL_RAW_SIZE {
+            return Err(ManifestError::TotalTooLarge(self.total_raw_size));
+        }
         let expected_chunks =
             crate::root::expected_chunk_count(self.total_raw_size, self.chunk_raw_size);
         if self.chunk_count != expected_chunks {
@@ -351,6 +381,9 @@ impl Manifest {
                 expected: expected_chunks,
             });
         }
+        if self.chunk_count > crate::root::MAX_CHUNK_COUNT {
+            return Err(ManifestError::ChunkCountTooLarge(self.chunk_count));
+        }
         if self.chunk_hashes.len() != self.chunk_count as usize {
             return Err(ManifestError::BadChunkHashesLen(self.chunk_count));
         }
@@ -358,8 +391,7 @@ impl Manifest {
         let mut non_directory_paths = std::collections::HashSet::new();
         let mut stream_end: u64 = 0;
         for (index, e) in self.entries.iter().enumerate() {
-            validate_path(&e.path)
-                .map_err(|reason| ManifestError::BadEntry { index, reason })?;
+            validate_path(&e.path).map_err(|reason| ManifestError::BadEntry { index, reason })?;
             if ![KIND_FILE, KIND_UTF8_TEXT, KIND_DIRECTORY].contains(&e.kind) {
                 return Err(ManifestError::BadEntry {
                     index,
@@ -399,9 +431,13 @@ impl Manifest {
                         expected: stream_end,
                     });
                 }
-                stream_end = stream_end
-                    .checked_add(e.content_size)
-                    .ok_or(ManifestError::BadEntry { index, reason: "size overflow" })?;
+                stream_end =
+                    stream_end
+                        .checked_add(e.content_size)
+                        .ok_or(ManifestError::BadEntry {
+                            index,
+                            reason: "size overflow",
+                        })?;
             }
         }
         if stream_end != self.total_raw_size {
@@ -416,11 +452,35 @@ impl Manifest {
     /// Serialize the full manifest bytes (header + entries + chunk table + TLVs).
     pub fn encode(&self) -> Result<Vec<u8>, ManifestError> {
         self.validate()?;
+        let chunk_area_len = self
+            .chunk_hashes
+            .len()
+            .checked_mul(32)
+            .ok_or(ManifestError::TooLarge(usize::MAX))?;
+        let ext_area = crate::tlv::encode_tlvs(&self.extensions)?;
+        let fixed_areas_len = HEADER_SIZE
+            .checked_add(chunk_area_len)
+            .and_then(|n| n.checked_add(ext_area.len()))
+            .ok_or(ManifestError::TooLarge(usize::MAX))?;
+        if fixed_areas_len > MAX_MANIFEST_BYTES {
+            return Err(ManifestError::TooLarge(fixed_areas_len));
+        }
+
         let mut entry_area = Vec::new();
         for e in &self.entries {
             let path = e.path.as_bytes();
             let ext = crate::tlv::encode_tlvs(&e.extensions)?;
-            let record_len = ENTRY_FIXED + path.len() + ext.len();
+            let record_len = ENTRY_FIXED
+                .checked_add(path.len())
+                .and_then(|n| n.checked_add(ext.len()))
+                .ok_or(ManifestError::TooLarge(usize::MAX))?;
+            let manifest_len = fixed_areas_len
+                .checked_add(entry_area.len())
+                .and_then(|n| n.checked_add(record_len))
+                .ok_or(ManifestError::TooLarge(usize::MAX))?;
+            if manifest_len > MAX_MANIFEST_BYTES {
+                return Err(ManifestError::TooLarge(manifest_len));
+            }
             entry_area.extend_from_slice(&(record_len as u32).to_be_bytes());
             entry_area.push(e.kind);
             entry_area.push(0); // flags
@@ -433,12 +493,7 @@ impl Manifest {
             entry_area.extend_from_slice(path);
             entry_area.extend_from_slice(&ext);
         }
-        let chunk_area_len = self.chunk_hashes.len() * 32;
-        let ext_area = crate::tlv::encode_tlvs(&self.extensions)?;
-        let manifest_len = HEADER_SIZE + entry_area.len() + chunk_area_len + ext_area.len();
-        if manifest_len > MAX_MANIFEST_BYTES {
-            return Err(ManifestError::TooLarge(manifest_len));
-        }
+        let manifest_len = fixed_areas_len + entry_area.len();
         let mut out = Vec::with_capacity(manifest_len);
         out.extend_from_slice(MANIFEST_MAGIC);
         out.push(MANIFEST_SCHEMA);
@@ -456,7 +511,11 @@ impl Manifest {
                 .map(|e| crate::id::EntryIdInput {
                     kind: e.kind,
                     path: &e.path,
-                    size: if e.kind == KIND_DIRECTORY { 0 } else { e.content_size },
+                    size: if e.kind == KIND_DIRECTORY {
+                        0
+                    } else {
+                        e.content_size
+                    },
                     entry_hash: e.content_hash,
                 })
                 .collect::<Vec<_>>(),
@@ -508,7 +567,8 @@ impl Manifest {
         let mut content_id_out = [0u8; 32];
         content_id_out.copy_from_slice(&bytes[32..64]);
         let entries_len = u32::from_be_bytes([bytes[64], bytes[65], bytes[66], bytes[67]]) as usize;
-        let chunk_hashes_len = u32::from_be_bytes([bytes[68], bytes[69], bytes[70], bytes[71]]) as usize;
+        let chunk_hashes_len =
+            u32::from_be_bytes([bytes[68], bytes[69], bytes[70], bytes[71]]) as usize;
         let ext_len = u32::from_be_bytes([bytes[72], bytes[73], bytes[74], bytes[75]]) as usize;
         let end = HEADER_SIZE
             .checked_add(entries_len)
@@ -527,6 +587,12 @@ impl Manifest {
         if entry_count > MAX_ENTRIES {
             return Err(ManifestError::TooManyEntries(entry_count as u32));
         }
+        if total_raw_size > crate::root::MAX_TOTAL_RAW_SIZE {
+            return Err(ManifestError::TotalTooLarge(total_raw_size));
+        }
+        if chunk_count > crate::root::MAX_CHUNK_COUNT {
+            return Err(ManifestError::ChunkCountTooLarge(chunk_count));
+        }
         // u64 math: on wasm32 `chunk_count as usize * 32` wraps for large
         // counts, letting an attacker smuggle a bogus count past this gate
         // and trigger a huge `Vec::with_capacity` / OOB indexing below.
@@ -541,7 +607,9 @@ impl Manifest {
             if bytes.len() - off < ENTRY_FIXED {
                 return Err(ManifestError::Truncated { what });
             }
-            let record_len = u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]) as usize;
+            let record_len =
+                u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+                    as usize;
             let kind = bytes[off + 4];
             if bytes[off + 5] != 0 || bytes[off + 6..off + 8] != [0; 2] {
                 return Err(ManifestError::BadEntry {
@@ -558,18 +626,32 @@ impl Manifest {
                 });
             }
             let content_offset = u64::from_be_bytes([
-                bytes[off + 12], bytes[off + 13], bytes[off + 14], bytes[off + 15],
-                bytes[off + 16], bytes[off + 17], bytes[off + 18], bytes[off + 19],
+                bytes[off + 12],
+                bytes[off + 13],
+                bytes[off + 14],
+                bytes[off + 15],
+                bytes[off + 16],
+                bytes[off + 17],
+                bytes[off + 18],
+                bytes[off + 19],
             ]);
             let content_size = u64::from_be_bytes([
-                bytes[off + 20], bytes[off + 21], bytes[off + 22], bytes[off + 23],
-                bytes[off + 24], bytes[off + 25], bytes[off + 26], bytes[off + 27],
+                bytes[off + 20],
+                bytes[off + 21],
+                bytes[off + 22],
+                bytes[off + 23],
+                bytes[off + 24],
+                bytes[off + 25],
+                bytes[off + 26],
+                bytes[off + 27],
             ]);
             let mut content_hash = [0u8; 32];
             content_hash.copy_from_slice(&bytes[off + 28..off + 60]);
             off += ENTRY_FIXED;
             if bytes.len() - off < path_len + e_ext_len {
-                return Err(ManifestError::Truncated { what: "entry path/TLVs" });
+                return Err(ManifestError::Truncated {
+                    what: "entry path/TLVs",
+                });
             }
             let path = core::str::from_utf8(&bytes[off..off + path_len])
                 .map_err(|_| ManifestError::BadEntry {
@@ -632,7 +714,11 @@ impl Manifest {
                 .map(|e| crate::id::EntryIdInput {
                     kind: e.kind,
                     path: &e.path,
-                    size: if e.kind == KIND_DIRECTORY { 0 } else { e.content_size },
+                    size: if e.kind == KIND_DIRECTORY {
+                        0
+                    } else {
+                        e.content_size
+                    },
                     entry_hash: e.content_hash,
                 })
                 .collect::<Vec<_>>(),
@@ -658,10 +744,18 @@ pub fn build_manifest<'a>(
     // failing the transfer. Sort by canonical path byte order afterwards
     // (identity requires it).
     use unicode_normalization::UnicodeNormalization;
+    if !crate::root::CHUNK_SIZES.contains(&chunk_raw_size) {
+        return Err(ManifestError::BadChunkSize(chunk_raw_size));
+    }
     let mut items: Vec<(u8, String, &[u8])> = items
         .into_iter()
         .map(|(kind, path, content)| (kind, path.nfc().collect::<String>(), content))
         .collect();
+    if items.len() > MAX_ENTRIES {
+        return Err(ManifestError::TooManyEntries(
+            u32::try_from(items.len()).unwrap_or(u32::MAX),
+        ));
+    }
     items.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
     let mut entries = Vec::new();
     let mut stream = Vec::new();
@@ -715,14 +809,16 @@ pub fn build_manifest<'a>(
         let end = (start + u64::from(chunk_raw_size)).min(stream.len() as u64);
         chunk_hashes.push(hash(&stream[start as usize..end as usize]));
     }
-    Ok(Manifest {
+    let manifest = Manifest {
         entries,
         chunk_count,
         chunk_raw_size,
         total_raw_size: total,
         chunk_hashes,
         extensions: vec![],
-    })
+    };
+    manifest.validate()?;
+    Ok(manifest)
 }
 
 #[cfg(test)]
@@ -765,7 +861,12 @@ mod tests {
         let m = sample();
         // total = 9 + 300 = 309 bytes, one 1 MiB chunk.
         assert_eq!(m.chunk_count, 1);
-        let stream_len = m.entries.iter().filter(|e| e.kind != KIND_DIRECTORY).map(|e| e.content_size).sum::<u64>();
+        let stream_len = m
+            .entries
+            .iter()
+            .filter(|e| e.kind != KIND_DIRECTORY)
+            .map(|e| e.content_size)
+            .sum::<u64>();
         assert_eq!(stream_len, 309);
         assert_eq!(m.chunk_hashes.len(), 1);
         let mut stream = Vec::new();
@@ -778,7 +879,14 @@ mod tests {
     #[test]
     fn rejects_path_violations() {
         for bad in [
-            "", "/abs", "a//b", ".", "..", "a/../b", "a\\b", "a\x01b",
+            "",
+            "/abs",
+            "a//b",
+            ".",
+            "..",
+            "a/../b",
+            "a\\b",
+            "a\x01b",
             &"x".repeat(1025),
         ] {
             assert!(validate_path(bad).is_err(), "path {bad:?} must be rejected");
@@ -845,15 +953,49 @@ mod tests {
     }
 
     #[test]
+    fn enforces_root_resource_caps_before_allocating_chunk_table() {
+        let mut too_large = sample();
+        too_large.total_raw_size = crate::root::MAX_TOTAL_RAW_SIZE + 1;
+        assert!(matches!(
+            too_large.encode(),
+            Err(ManifestError::TotalTooLarge(_))
+        ));
+
+        let mut too_many_chunks = sample();
+        too_many_chunks.total_raw_size = (u64::from(crate::root::MAX_CHUNK_COUNT) + 1) * (1 << 20);
+        too_many_chunks.chunk_count = crate::root::MAX_CHUNK_COUNT + 1;
+        assert!(matches!(
+            too_many_chunks.encode(),
+            Err(ManifestError::ChunkCountTooLarge(_))
+        ));
+
+        let mut wire = sample().encode().unwrap();
+        wire[24..32].copy_from_slice(&(crate::root::MAX_TOTAL_RAW_SIZE + 1).to_be_bytes());
+        assert!(matches!(
+            Manifest::parse(&wire),
+            Err(ManifestError::TotalTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn builders_reject_invalid_chunk_size_without_panicking() {
+        assert!(matches!(
+            build_manifest([(KIND_FILE, "a", b"x" as &[u8])], 0),
+            Err(ManifestError::BadChunkSize(0))
+        ));
+        assert!(matches!(
+            build_manifest_from_hashes([(KIND_FILE, "a".to_string(), 1, hash(b"x"))], 0, vec![]),
+            Err(ManifestError::BadChunkSize(0))
+        ));
+    }
+
+    #[test]
     fn rejects_unsorted_and_stream_gaps() {
         // Unsorted input is auto-sorted by build_manifest; craft a raw
         // manifest with a broken stream chain instead.
         let mut m = sample();
         m.entries[0].content_offset = 5; // gap
-        assert!(matches!(
-            m.encode(),
-            Err(ManifestError::StreamGap { .. })
-        ));
+        assert!(matches!(m.encode(), Err(ManifestError::StreamGap { .. })));
         let mut m = sample();
         m.total_raw_size += 1; // end mismatch
         assert!(matches!(
@@ -914,7 +1056,10 @@ mod tests {
         b2[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&(orig_rec_len + 5).to_be_bytes());
         assert!(matches!(
             Manifest::parse(&b2),
-            Err(ManifestError::BadEntry { reason: "record_len does not match fields", .. })
+            Err(ManifestError::BadEntry {
+                reason: "record_len does not match fields",
+                ..
+            })
         ));
     }
 }

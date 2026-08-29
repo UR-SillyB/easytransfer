@@ -616,11 +616,27 @@ class ScanActivity : ComponentActivity() {
                 spillFile.delete()
                 continue
             }
+            val resumed = session.snapshot()
+            if (
+                resumed.transferIdHex != led.transferIdHex ||
+                resumed.chunkRawSize != led.chunkRawSize ||
+                resumed.chunkCount <= 0
+            ) {
+                // The ROOT, not the JSON header, owns identity and geometry.
+                // Reset the now-locked native receiver before trying an older
+                // candidate; otherwise every later resume would be rejected.
+                led.discard()
+                spillFile.delete()
+                session.destroy()
+                session = ReceiverSessionManager()
+                continue
+            }
+            val completed = led.completedIndices.filter { it < resumed.chunkCount }.toIntArray()
             ledger = led
             chunkSpill = ChunkSpillStore(cacheDir, led.transferIdHex)
-            chunkSpill?.markResumed(led.completedIndices)
-            pendingReverify = led.completedIndices.toMutableSet()
-            Log.i(TAG, "resumed transfer ${led.transferIdHex} with ${led.completedIndices.size} chunks")
+            chunkSpill?.markResumed(completed)
+            pendingReverify = completed.toMutableSet()
+            Log.i(TAG, "resumed transfer ${led.transferIdHex} with ${completed.size} chunks")
             return
         }
     }

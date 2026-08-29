@@ -18,6 +18,11 @@ export interface SyncHandleLike {
 export type ChunkStorage = "disk" | "memory"
 
 const MAX_MEMORY_FALLBACK_BYTES = 64 * 1024 * 1024
+const MAX_LEDGER_BYTES = 32 * 1024 * 1024
+const MAX_ROOT_FRAME_HEX_CHARS = (26 + 2400 + 4) * 2
+const MAX_CHUNK_INDEX = 131_072 - 1
+const LEDGER_NAME_RE = /^af2-([0-9a-f]{32})\.ledger\.jsonl$/
+const LEGAL_CHUNK_RAW_SIZES = new Set([1, 2, 4, 8, 16, 32].map((mib) => mib * 1024 * 1024))
 /**
  * In-process delivery timestamps for OPFS files backing lazy Blobs.  File
  * lastModified is the last chunk-write time, which can be hours old for a
@@ -347,6 +352,15 @@ export class OpfsJournal {
   async init(dir: FileSystemDirectoryHandle | null, transferIdHex: string, crs: number, rootHex: string): Promise<void> {
     if (this.transferId === transferIdHex && this.opfsDir === dir && this.journalFile) return
 
+    if (
+      !/^[0-9a-f]{32}$/.test(transferIdHex) ||
+      !LEGAL_CHUNK_RAW_SIZES.has(crs) ||
+      rootHex.length > MAX_ROOT_FRAME_HEX_CHARS ||
+      hexToBytes(rootHex).byteLength === 0
+    ) {
+      throw new Error("AF2_STORAGE_FATAL: 断点日志头字段无效")
+    }
+
     this.opfsDir = dir
     this.transferId = transferIdHex
     this.journalFile = null
@@ -381,10 +395,16 @@ export class OpfsJournal {
   }
 
   async commit(index: number): Promise<void> {
+    if (!Number.isSafeInteger(index) || index < 0 || index > MAX_CHUNK_INDEX) {
+      throw new Error("AF2_STORAGE_FATAL: 断点日志分块索引无效")
+    }
     await this.append({ c: index })
   }
 
   async invalidate(index: number): Promise<void> {
+    if (!Number.isSafeInteger(index) || index < 0 || index > MAX_CHUNK_INDEX) {
+      throw new Error("AF2_STORAGE_FATAL: 断点日志分块索引无效")
+    }
     await this.append({ i: index })
   }
 
@@ -431,18 +451,18 @@ export class OpfsJournal {
   } | null> {
     if (!dir) return null
     try {
-      const candidates: Array<{ handle: FileSystemFileHandle; mtime: number }> = []
+      const candidates: Array<{ handle: FileSystemFileHandle; name: string; mtime: number }> = []
       for await (const [name, handle] of (dir as any).entries()) {
         if (typeof name === "string" && name.endsWith(".ledger.jsonl") && handle.kind === "file") {
           const file = await handle.getFile()
-          candidates.push({ handle, mtime: file.lastModified })
+          candidates.push({ handle, name, mtime: file.lastModified })
         }
       }
       candidates.sort((a, b) => b.mtime - a.mtime)
 
       // A torn/corrupt newest ledger must not hide an older valid transfer.
-      for (const { handle } of candidates) {
-        const parsed = await this.parseLedger(handle)
+      for (const { handle, name } of candidates) {
+        const parsed = await this.parseLedger(handle, name)
         if (parsed) return parsed
       }
       return null
@@ -451,18 +471,41 @@ export class OpfsJournal {
     }
   }
 
-  private static async parseLedger(handle: FileSystemFileHandle): Promise<{
+  private static async parseLedger(handle: FileSystemFileHandle, fileName = handle.name): Promise<{
     transferIdHex: string
     rootFrameBytes: Uint8Array
     chunkRawSize: number
     completed: number[]
   } | null> {
     try {
-      const text = await (await handle.getFile()).text()
-      const lines = text.split("\n").filter((l) => l.trim().length > 0)
-      if (lines.length === 0) return null
+      const fileTid = LEDGER_NAME_RE.exec(fileName)?.[1]
+      if (!fileTid) return null
+      const file = await handle.getFile()
+      if (file.size > MAX_LEDGER_BYTES) return null
+      const text = await file.text()
+      const tailTerminated = text.endsWith("\n")
+      let durableText = text
+      if (!tailTerminated) {
+        const lastNewline = text.lastIndexOf("\n")
+        if (lastNewline < 0) return null
+        durableText = text.slice(0, lastNewline + 1)
+      }
+      const lines = durableText.split("\n")
+      lines.pop()
+      // Writers append records as one JSON object plus a final newline. Blank
+      // physical records are corruption, not harmless whitespace: filtering
+      // them out can hide a damaged invalidation record. Likewise, only an
+      // unterminated final fragment may be treated as a crash-torn append.
+      if (lines.length === 0 || lines.some((line) => line.trim().length === 0)) return null
       const header = JSON.parse(lines[0])
-      if (!header.tid || !header.root) return null
+      if (
+        header.v !== 1 ||
+        typeof header.tid !== "string" ||
+        header.tid !== fileTid ||
+        typeof header.root !== "string" ||
+        header.root.length > MAX_ROOT_FRAME_HEX_CHARS ||
+        !LEGAL_CHUNK_RAW_SIZES.has(header.crs)
+      ) return null
       const rootFrameBytes = hexToBytes(header.root)
       if (rootFrameBytes.byteLength === 0) return null
 
@@ -470,16 +513,50 @@ export class OpfsJournal {
       for (let i = 1; i < lines.length; i++) {
         try {
           const o = JSON.parse(lines[i])
-          if (Number.isInteger(o.c) && o.c >= 0) completed.add(o.c)
-          if (Number.isInteger(o.i) && o.i >= 0) completed.delete(o.i)
+          const keys = o && typeof o === "object" ? Object.keys(o) : []
+          if (
+            keys.length === 1 &&
+            keys[0] === "c" &&
+            Number.isSafeInteger(o.c) &&
+            o.c >= 0 &&
+            o.c <= MAX_CHUNK_INDEX
+          ) {
+            completed.add(o.c)
+          } else if (
+            keys.length === 1 &&
+            keys[0] === "i" &&
+            Number.isSafeInteger(o.i) &&
+            o.i >= 0 &&
+            o.i <= MAX_CHUNK_INDEX
+          ) {
+            completed.delete(o.i)
+          } else {
+            return null
+          }
         } catch {
-          // Ignore a torn trailing line; earlier committed records stay valid.
+          return null
+        }
+      }
+      if (!tailTerminated) {
+        // The newline is the record's commit delimiter. Truncate any crash
+        // fragment before returning a resumable journal; otherwise the next
+        // append would concatenate onto it and create permanent corruption.
+        let writer: any = null
+        try {
+          if ((await handle.getFile()).size !== file.size) return null
+          const durableByteLength = new TextEncoder().encode(durableText).byteLength
+          writer = await (handle as any).createWritable({ keepExistingData: true })
+          await writer.truncate(durableByteLength)
+          await writer.close()
+        } catch {
+          try { await writer?.abort?.() } catch {}
+          return null
         }
       }
       return {
         transferIdHex: header.tid,
         rootFrameBytes,
-        chunkRawSize: header.crs || 8 * 1024 * 1024,
+        chunkRawSize: header.crs,
         completed: Array.from(completed).sort((a, b) => a - b),
       }
     } catch {

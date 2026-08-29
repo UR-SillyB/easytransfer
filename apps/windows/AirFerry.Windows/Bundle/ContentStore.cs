@@ -374,14 +374,16 @@ public static class ContentStore
             if (LoadIndex().Count > 0) return;
             string legacy = LegacyReceivedDir;
             if (!Directory.Exists(legacy)) return;
-            foreach (string f in Directory.EnumerateFiles(legacy, "*", SearchOption.AllDirectories))
+            // Materialize the list before PutFile moves members out of the
+            // tree. Streaming keeps legacy multi-GiB archives bounded-memory.
+            foreach (string f in Directory.EnumerateFiles(
+                legacy, "*", SearchOption.AllDirectories).ToList())
             {
                 if (f.EndsWith(".meta", StringComparison.OrdinalIgnoreCase)) continue;
                 try
                 {
-                    byte[] bytes = File.ReadAllBytes(f);
                     string name = Path.GetFileName(f);
-                    PutBytes(name, bytes);
+                    PutFile(name, f, expectedSize: new FileInfo(f).Length);
                 }
                 catch
                 {

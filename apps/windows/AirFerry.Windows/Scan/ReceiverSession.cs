@@ -198,7 +198,11 @@ public sealed class ReceiverSession : IDisposable
             {
                 return false;
             }
-            return NativeBridge.ReceiverResume(_handle, rootFrameBytes, (nuint)rootFrameBytes.Length, completedIndices, (nuint)completedIndices.Length) == 1;
+            bool resumed = NativeBridge.ReceiverResume(
+                _handle, rootFrameBytes, (nuint)rootFrameBytes.Length,
+                completedIndices, (nuint)completedIndices.Length) == 1;
+            if (resumed) _cachedSnapshot = null;
+            return resumed;
         }
     }
 
@@ -347,7 +351,8 @@ public sealed class ReceiverSession : IDisposable
                 _cachedSnapshot = snap;
                 return snap;
             }
-            catch (System.Text.Json.JsonException)
+            catch (Exception ex) when (ex is System.Text.Json.JsonException
+                or InvalidOperationException or FormatException or OverflowException)
             {
                 return _cachedSnapshot ?? new Snapshot();
             }
@@ -364,12 +369,8 @@ public sealed class ReceiverSession : IDisposable
         {
             return Array.Empty<byte>();
         }
-        var b = new byte[s.Length / 2];
-        for (int i = 0; i < b.Length; i++)
-        {
-            b[i] = Convert.ToByte(s.Substring(i * 2, 2), 16);
-        }
-        return b;
+        try { return Convert.FromHexString(s); }
+        catch (FormatException) { return Array.Empty<byte>(); }
     }
 
     public string FileName()

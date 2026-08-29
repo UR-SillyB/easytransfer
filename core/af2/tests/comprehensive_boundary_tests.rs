@@ -350,8 +350,9 @@ fn boundary_suite_5_stream_switching_and_relock() {
     // Ingest 3rd frame from B -> Relocked! (Streak 3 reached)
     assert_eq!(rx.ingest(&fb_root).unwrap(), IngestEvent::Relocked);
 
-    // Next frame from B locks the new root
-    assert_eq!(rx.ingest(&fb_root).unwrap(), IngestEvent::RootLocked);
+    // The threshold-crossing ROOT atomically locks B; the next copy is a
+    // duplicate (META/SYMBOL may safely follow immediately after Relocked).
+    assert_eq!(rx.ingest(&fb_root).unwrap(), IngestEvent::Dropped);
 }
 
 #[test]
@@ -579,7 +580,12 @@ fn boundary_suite_10_zero_byte_entries_in_streamed_selection() {
     let manifest = build_manifest_from_hashes(
         vec![
             (KIND_FILE, "empty.bin".to_string(), 0, empty_hash()),
-            (KIND_FILE, "data.bin".to_string(), text.len() as u64, hash(&text)),
+            (
+                KIND_FILE,
+                "data.bin".to_string(),
+                text.len() as u64,
+                hash(&text),
+            ),
         ],
         1 << 20,
         vec![hash(&text)],
@@ -599,9 +605,7 @@ fn boundary_suite_10_zero_byte_entries_in_streamed_selection() {
         redundancy_pct: 10,
     };
     let mut sender = af2::sender::Af2Sender::from_manifest_streamed(manifest, config).unwrap();
-    sender
-        .stage_chunk(0, CODEC_RAW, text.clone())
-        .unwrap();
+    sender.stage_chunk(0, CODEC_RAW, text.clone()).unwrap();
     let mut rx = Af2Receiver::new();
     let mut chunks: HashMap<u32, Vec<u8>> = HashMap::new();
     let chunk_count = 1usize;
@@ -624,7 +628,10 @@ fn boundary_suite_10_zero_byte_entries_in_streamed_selection() {
             }
         }
     }
-    assert!(complete, "selection containing a zero-byte file must transfer");
+    assert!(
+        complete,
+        "selection containing a zero-byte file must transfer"
+    );
     let m = rx.manifest().expect("manifest decoded");
     assert!(
         m.entries

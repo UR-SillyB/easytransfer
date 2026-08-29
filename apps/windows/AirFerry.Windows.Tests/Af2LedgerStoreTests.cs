@@ -11,6 +11,8 @@ namespace AirFerry.Windows.Tests;
 /// </summary>
 public class Af2LedgerStoreTests
 {
+    private const int ChunkRawSize = 8 * 1024 * 1024;
+
     private static string TempRoot()
     {
         string dir = Path.Combine(Path.GetTempPath(), "AirFerry.Af2LedgerStoreTests",
@@ -27,16 +29,16 @@ public class Af2LedgerStoreTests
         string dir = TempRoot();
         try
         {
-            var store = Af2LedgerStore.Create(dir, "tid-a", 8192, RootFrame);
+            var store = Af2LedgerStore.Create(dir, "tid-a", ChunkRawSize, RootFrame);
             Assert.Equal("tid-a", store.TransferIdHex);
-            Assert.Equal(8192, store.ChunkRawSize);
+            Assert.Equal(ChunkRawSize, store.ChunkRawSize);
             Assert.Equal(RootFrame, store.RootFrameBytes);
 
             // Reload from disk as a fresh process would.
             var reloaded = Af2LedgerStore.LoadMostRecent(dir);
             Assert.NotNull(reloaded);
             Assert.Equal("tid-a", reloaded!.TransferIdHex);
-            Assert.Equal(8192, reloaded.ChunkRawSize);
+            Assert.Equal(ChunkRawSize, reloaded.ChunkRawSize);
             Assert.Equal(RootFrame, reloaded.RootFrameBytes);
         }
         finally
@@ -51,7 +53,7 @@ public class Af2LedgerStoreTests
         string dir = TempRoot();
         try
         {
-            var store = Af2LedgerStore.Create(dir, "tid-b", 8192, RootFrame);
+            var store = Af2LedgerStore.Create(dir, "tid-b", ChunkRawSize, RootFrame);
             store.Commit(2);
             store.Commit(5);
             store.Commit(9);
@@ -72,7 +74,7 @@ public class Af2LedgerStoreTests
         string dir = TempRoot();
         try
         {
-            var store = Af2LedgerStore.Create(dir, "tid-c", 8192, RootFrame);
+            var store = Af2LedgerStore.Create(dir, "tid-c", ChunkRawSize, RootFrame);
             store.Commit(1);
             store.Commit(3);
             // Crash mid-append: a partial JSON fragment at the tail. It must
@@ -81,6 +83,121 @@ public class Af2LedgerStoreTests
 
             var reloaded = Af2LedgerStore.LoadMostRecent(dir)!;
             Assert.Equal(new[] { 1, 3 }, reloaded.CompletedIndices);
+            Assert.EndsWith("\n", File.ReadAllText(
+                Path.Combine(dir, "af2-tid-c.ledger.jsonl")));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void CompleteUnterminatedRecordIsTruncatedBeforeLaterAppends()
+    {
+        string dir = TempRoot();
+        try
+        {
+            var store = Af2LedgerStore.Create(dir, "tid-unsealed", ChunkRawSize, RootFrame);
+            store.Commit(1);
+            string journal = Path.Combine(dir, "af2-tid-unsealed.ledger.jsonl");
+            File.AppendAllText(journal, "{\"c\":2}");
+
+            var resumed = Af2LedgerStore.LoadMostRecent(dir)!;
+            Assert.Equal(new[] { 1 }, resumed.CompletedIndices);
+            resumed.Commit(3);
+
+            var reloaded = Af2LedgerStore.LoadMostRecent(dir)!;
+            Assert.Equal(new[] { 1, 3 }, reloaded.CompletedIndices);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void MalformedFinalRecordWithNewlineIsRejected()
+    {
+        string dir = TempRoot();
+        try
+        {
+            Af2LedgerStore store = Af2LedgerStore.Create(dir, "tid-tail", ChunkRawSize, RootFrame);
+            store.Commit(1);
+            File.AppendAllText(Path.Combine(dir, "af2-tid-tail.ledger.jsonl"), "{bad\n");
+
+            Assert.Null(Af2LedgerStore.LoadMostRecent(dir));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void CorruptionBeforeTailRejectsCandidate()
+    {
+        string dir = TempRoot();
+        try
+        {
+            var store = Af2LedgerStore.Create(dir, "tid-mid", ChunkRawSize, RootFrame);
+            store.Commit(1);
+            File.AppendAllText(Path.Combine(dir, "af2-tid-mid.ledger.jsonl"),
+                "{bad\n{\"c\":2}\n");
+            Assert.Null(Af2LedgerStore.LoadMostRecent(dir));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void HeaderTransferIdMustMatchLedgerFileName()
+    {
+        string dir = TempRoot();
+        try
+        {
+            string rootHex = Convert.ToHexString(RootFrame).ToLowerInvariant();
+            File.WriteAllText(Path.Combine(dir, "af2-tid-file.ledger.jsonl"),
+                $"{{\"v\":1,\"tid\":\"tid-other\",\"crs\":{ChunkRawSize},\"root\":\"{rootHex}\"}}\n");
+            Assert.Null(Af2LedgerStore.LoadMostRecent(dir));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void CommitRejectsOutOfProtocolIndex()
+    {
+        string dir = TempRoot();
+        try
+        {
+            var store = Af2LedgerStore.Create(dir, "tid-index", ChunkRawSize, RootFrame);
+            Assert.Throws<ArgumentOutOfRangeException>(() => store.Commit(131_072));
+            Assert.Empty(store.CompletedIndices);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void FailedReloadClearsStateAndPreventsFurtherAppends()
+    {
+        string dir = TempRoot();
+        try
+        {
+            var store = Af2LedgerStore.Create(dir, "tid-reload", ChunkRawSize, RootFrame);
+            File.WriteAllText(Path.Combine(dir, "af2-tid-reload.ledger.jsonl"), "bad\n");
+
+            Assert.False(store.Reload());
+            Assert.Equal("", store.TransferIdHex);
+            Assert.Empty(store.RootFrameBytes);
+            Assert.Throws<IOException>(() => store.Commit(1));
         }
         finally
         {
@@ -151,7 +268,7 @@ public class Af2LedgerStoreTests
         string dir = TempRoot();
         try
         {
-            var old = Af2LedgerStore.Create(dir, "tid-old", 8192, RootFrame);
+            var old = Af2LedgerStore.Create(dir, "tid-old", ChunkRawSize, RootFrame);
             old.Commit(1);
             File.SetLastWriteTimeUtc(Path.Combine(dir, "af2-tid-old.ledger.jsonl"),
                 DateTime.UtcNow.AddMinutes(-2));
@@ -176,13 +293,13 @@ public class Af2LedgerStoreTests
         string dir = TempRoot();
         try
         {
-            var old = Af2LedgerStore.Create(dir, "tid-old", 8192, RootFrame);
+            var old = Af2LedgerStore.Create(dir, "tid-old", ChunkRawSize, RootFrame);
             old.Commit(1);
             File.SetLastWriteTimeUtc(Path.Combine(dir, "af2-tid-old.ledger.jsonl"),
                 DateTime.UtcNow.AddMinutes(-2));
             string invalid = Path.Combine(dir, "af2-tid-new.ledger.jsonl");
             File.WriteAllText(invalid,
-                "{\"v\":1,\"tid\":\"tid-new\",\"crs\":8192,\"root\":\"zz\"}\n");
+                $"{{\"v\":1,\"tid\":\"tid-new\",\"crs\":{ChunkRawSize},\"root\":\"zz\"}}\n");
             File.SetLastWriteTimeUtc(invalid, DateTime.UtcNow);
 
             var loaded = Af2LedgerStore.LoadMostRecent(dir);
@@ -201,7 +318,7 @@ public class Af2LedgerStoreTests
         string dir = TempRoot();
         try
         {
-            var store = Af2LedgerStore.Create(dir, "tid-fail", 8192, RootFrame);
+            var store = Af2LedgerStore.Create(dir, "tid-fail", ChunkRawSize, RootFrame);
             string journal = Path.Combine(dir, "af2-tid-fail.ledger.jsonl");
             File.Delete(journal);
             Directory.CreateDirectory(journal);
@@ -221,7 +338,7 @@ public class Af2LedgerStoreTests
         string dir = TempRoot();
         try
         {
-            var store = Af2LedgerStore.Create(dir, "tid-reset", 8192, RootFrame);
+            var store = Af2LedgerStore.Create(dir, "tid-reset", ChunkRawSize, RootFrame);
             string journal = Path.Combine(dir, "af2-tid-reset.ledger.jsonl");
             string spill = Path.Combine(dir, "af2-tid-reset.partial");
             File.WriteAllBytes(spill, [1, 2, 3]);
@@ -243,7 +360,7 @@ public class Af2LedgerStoreTests
         string dir = TempRoot();
         try
         {
-            Af2LedgerStore.Create(dir, "tid-live", 8192, RootFrame);
+            Af2LedgerStore.Create(dir, "tid-live", ChunkRawSize, RootFrame);
             string live = Path.Combine(dir, "af2-tid-live.partial");
             string orphan = Path.Combine(dir, "af2-tid-orphan.partial");
             string badJournal = Path.Combine(dir, "af2-tid-bad.ledger.jsonl");

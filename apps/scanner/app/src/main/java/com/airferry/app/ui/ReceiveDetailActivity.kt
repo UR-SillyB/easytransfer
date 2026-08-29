@@ -273,22 +273,28 @@ class ReceiveDetailActivity : ComponentActivity() {
     /**
      * Legacy path: only used when reopening old flows that still pass a
      * non-store temp file without RESAVE. New scans put RESAVE=true after
-     * ContentStore.putBytes so this is a no-op for modern transfers.
+     * ContentStore.putFile so this is a no-op for modern transfers.
      */
     private fun copyToReceivedDir() {
         try {
             val src = recoveredFile ?: return
             // Already under ContentStore blobs — nothing to archive.
-            val storeRoot = com.airferry.app.scan.ContentStore.root(this).canonicalPath
-            if (src.canonicalPath.startsWith(storeRoot)) return
+            val canonicalSrc = src.canonicalFile
+            val blobRoot = java.io.File(
+                com.airferry.app.scan.ContentStore.root(this), "blobs"
+            ).canonicalFile
+            val blobPrefix = blobRoot.path.trimEnd(java.io.File.separatorChar) +
+                java.io.File.separator
+            if (canonicalSrc.path.startsWith(blobPrefix)) return
 
-            val put = com.airferry.app.scan.ContentStore.putBytes(
-                this, fileName, src.readBytes(),
-                crcHex = java.lang.Long.toHexString(
-                    ScanActivity.crc32OfBytes(src.readBytes())
+            val put = com.airferry.app.scan.ContentStore.putFile(
+                this, fileName, canonicalSrc,
+                crcHex = java.lang.String.format(
+                    java.util.Locale.ROOT, "%08x", ScanActivity.crc32OfFile(canonicalSrc)
                 ),
                 crcUnknown = false,
                 kind = "file",
+                expectedSize = canonicalSrc.length(),
             )
             recoveredFile = put.path
         } catch (e: Exception) {

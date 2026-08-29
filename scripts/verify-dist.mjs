@@ -88,9 +88,17 @@ const uploadFiles = existsSync(distDir)
 // Signing inputs belong in AIRFERRY_SIGNING_DIR (default .airferry-signing),
 // never beside release artifacts. Fail closed on all common private-key forms.
 const secretFile = /\.(?:pem|key|keystore|jks|p12|pfx)$/i
-const unexpectedSecretFiles = existsSync(distDir)
-  ? readdirSync(distDir).filter((name) => secretFile.test(name))
-  : []
+function findSecretFiles(dir, prefix = "") {
+  if (!existsSync(dir)) return []
+  const hits = []
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const relative = path.join(prefix, entry.name)
+    if (entry.isDirectory()) hits.push(...findSecretFiles(path.join(dir, entry.name), relative))
+    else if (secretFile.test(entry.name)) hits.push(relative)
+  }
+  return hits
+}
+const unexpectedSecretFiles = findSecretFiles(distDir)
 if (unexpectedSecretFiles.length > 0) {
   console.error(`✗ CRITICAL: unexpected secret/key file(s) in dist/: ${unexpectedSecretFiles.join(", ")}`)
   process.exit(1)
@@ -194,6 +202,27 @@ function listZipEntries(file) {
   }
   return entries
 }
+
+// Recompute after packaging (the pre-package uploadFiles list may be stale),
+// then inspect every ZIP-based upload for accidentally bundled key material.
+// Checking only dist/'s top-level filenames misses a private key copied into a
+// web/extension/publish tree and subsequently hidden inside the archive.
+const packagedUploads = readdirSync(dist).filter((name) => releaseName.test(name)).sort()
+for (const name of packagedUploads.filter((name) => /\.(?:zip|xpi|apk)$/i.test(name))) {
+  try {
+    const secretEntries = listZipEntries(path.join(dist, name)).filter((entry) =>
+      secretFile.test(entry)
+    )
+    if (secretEntries.length > 0) {
+      console.error(`✗ CRITICAL: ${name} contains private-key file(s): ${secretEntries.join(", ")}`)
+      process.exit(1)
+    }
+  } catch (e) {
+    console.error(`✗ release archive is unreadable (${name}): ${e.message}`)
+    process.exit(1)
+  }
+}
+console.log("   packaged archives contain no private-key filenames")
 
 console.log("▶ 6. FAST ZXing receiver payload check")
 try {

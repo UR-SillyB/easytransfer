@@ -271,6 +271,59 @@ impl Af2Sender {
         Self::build_from_manifest(manifest, None, config, Vec::new())
     }
 
+    /// Streamed resend-cache construction with a metadata binding check.
+    /// Unlike [`Self::from_manifest_streamed`], this entry point proves that
+    /// the cached Manifest still covers the caller's complete current
+    /// selection. Content/chunk hashes remain cache-provided and are checked
+    /// later when each raw chunk is staged, but a swapped/corrupt cache record
+    /// cannot silently omit or rename selected entries.
+    pub fn from_manifest_streamed_checked(
+        manifest: Manifest,
+        items: Vec<(u8, String, u64)>,
+        config: SenderConfig,
+    ) -> Result<Self, SenderError> {
+        use std::collections::HashMap;
+        use unicode_normalization::UnicodeNormalization;
+
+        let mut item_index: HashMap<String, (u8, u64)> = HashMap::with_capacity(items.len());
+        for (kind, path, size) in items {
+            let normalized_path = path.nfc().collect::<String>();
+            if item_index.insert(normalized_path.clone(), (kind, size)).is_some() {
+                return Err(SenderError::Config(format!(
+                    "selected items contain duplicate normalized path {normalized_path:?}"
+                )));
+            }
+        }
+        if item_index.len() != manifest.entries.len() {
+            return Err(SenderError::Config(format!(
+                "selected item count {} != cached manifest entry count {}",
+                item_index.len(),
+                manifest.entries.len()
+            )));
+        }
+        for entry in &manifest.entries {
+            let Some(&(kind, size)) = item_index.get(&entry.path) else {
+                return Err(SenderError::Config(format!(
+                    "cached manifest entry {:?} is missing from the selected items",
+                    entry.path
+                )));
+            };
+            if kind != entry.kind {
+                return Err(SenderError::Config(format!(
+                    "cached manifest entry {:?} kind {} != selected item kind {kind}",
+                    entry.path, entry.kind
+                )));
+            }
+            if size != entry.content_size {
+                return Err(SenderError::Config(format!(
+                    "cached manifest entry {:?} size {} != selected item size {size}",
+                    entry.path, entry.content_size
+                )));
+            }
+        }
+        Self::build_from_manifest(manifest, None, config, Vec::new())
+    }
+
     fn build_from_manifest(
         manifest: Manifest,
         items: Option<Vec<(u8, String, Vec<u8>)>>,
@@ -413,11 +466,69 @@ impl Af2Sender {
             use unicode_normalization::UnicodeNormalization;
             let mut item_index: HashMap<String, usize> = HashMap::with_capacity(items.len());
             for (i, (_, path, _)) in items.iter().enumerate() {
-                // Duplicate normalized keys correspond to transfers build_manifest
-                // already rejected above, so overwrite is unreachable.
-                item_index.insert(path.nfc().collect::<String>(), i);
+                let normalized_path = path.nfc().collect::<String>();
+                if item_index.insert(normalized_path.clone(), i).is_some() {
+                    return Err(SenderError::Config(format!(
+                        "selected items contain duplicate normalized path {normalized_path:?}"
+                    )));
+                }
             }
-            stream.reserve(manifest.total_raw_size as usize);
+            if item_index.len() != manifest.entries.len() {
+                return Err(SenderError::Config(format!(
+                    "selected item count {} != cached manifest entry count {}",
+                    item_index.len(),
+                    manifest.entries.len()
+                )));
+            }
+            // Preflight the cached Manifest against the actual item geometry
+            // before reserving its attacker/corruption-controlled total. A stale
+            // cache that claims GiB/TiB for a tiny selection must return a normal
+            // error instead of reaching Vec::reserve and potentially aborting the
+            // process (workspace release builds use panic=abort).
+            let mut assembled_len = 0u64;
+            for e in &manifest.entries {
+                let Some(&item_pos) = item_index.get(&e.path) else {
+                    return Err(SenderError::Config(format!(
+                        "cached manifest entry {:?} is missing from the selected items",
+                        e.path
+                    )));
+                };
+                let (item_kind, _, item_bytes) = &items[item_pos];
+                if *item_kind != e.kind {
+                    return Err(SenderError::Config(format!(
+                        "cached manifest entry {:?} kind {} != selected item kind {item_kind}",
+                        e.path, e.kind
+                    )));
+                }
+                let item_len = item_bytes.len() as u64;
+                if item_len != e.content_size {
+                    return Err(SenderError::Config(format!(
+                        "cached manifest entry {:?} size {} != selected item size {item_len}",
+                        e.path, e.content_size
+                    )));
+                }
+                if e.kind != crate::id::KIND_DIRECTORY {
+                    assembled_len = assembled_len.checked_add(item_len).ok_or_else(|| {
+                        SenderError::Config("assembled stream length overflow".into())
+                    })?;
+                }
+            }
+            if assembled_len != manifest.total_raw_size {
+                return Err(SenderError::Config(format!(
+                    "assembled stream length {assembled_len} != manifest total_raw_size {} — item set inconsistent with manifest",
+                    manifest.total_raw_size
+                )));
+            }
+            let stream_capacity = usize::try_from(assembled_len).map_err(|_| {
+                SenderError::Config(format!(
+                    "assembled stream length {assembled_len} does not fit this host"
+                ))
+            })?;
+            stream.try_reserve_exact(stream_capacity).map_err(|e| {
+                SenderError::Config(format!(
+                    "cannot reserve {stream_capacity} bytes for canonical stream: {e}"
+                ))
+            })?;
             for e in &manifest.entries {
                 if e.kind != crate::id::KIND_DIRECTORY {
                     if let Some(&i) = item_index.get(&e.path) {
@@ -2017,6 +2128,96 @@ mod tests {
                 "unexpected error: {e}"
             ),
         }
+    }
+
+    #[test]
+    fn from_manifest_rejects_huge_stale_size_before_stream_allocation() {
+        let total_raw_size = 2u64 << 30;
+        let chunk_raw_size = 32 << 20;
+        let chunk_count = crate::root::expected_chunk_count(total_raw_size, chunk_raw_size);
+        let manifest = crate::manifest::Manifest {
+            entries: vec![crate::manifest::ManifestEntry {
+                kind: KIND_FILE,
+                path: "huge.bin".to_string(),
+                content_offset: 0,
+                content_size: total_raw_size,
+                content_hash: hash(b"x"),
+                extensions: vec![],
+            }],
+            chunk_count,
+            chunk_raw_size,
+            total_raw_size,
+            chunk_hashes: vec![[0u8; 32]; chunk_count as usize],
+            extensions: vec![],
+        };
+        let err = Af2Sender::from_manifest(
+            manifest,
+            vec![(KIND_FILE, "huge.bin".to_string(), vec![b'x'])],
+            SenderConfig {
+                chunk_raw_size,
+                ..SenderConfig::default()
+            },
+        )
+        .err()
+        .expect("stale cached size must be rejected");
+        assert!(
+            err.to_string().contains("selected item size 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn from_manifest_rejects_selected_items_missing_from_cache() {
+        let chunk_raw_size = 1 << 20;
+        let manifest = build_manifest(
+            [(KIND_FILE, "cached.bin", b"cached" as &[u8])],
+            chunk_raw_size,
+        )
+        .unwrap();
+        let err = Af2Sender::from_manifest(
+            manifest,
+            vec![
+                (KIND_FILE, "cached.bin".to_string(), b"cached".to_vec()),
+                (KIND_FILE, "new.bin".to_string(), b"new".to_vec()),
+            ],
+            SenderConfig {
+                chunk_raw_size,
+                ..SenderConfig::default()
+            },
+        )
+        .err()
+        .expect("a cached manifest must not silently omit selected items");
+        assert!(
+            err.to_string().contains("selected item count 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn streamed_cached_manifest_rejects_selected_items_it_omits() {
+        let chunk_raw_size = 1 << 20;
+        let manifest = build_manifest(
+            [(KIND_FILE, "cached.bin", b"cached" as &[u8])],
+            chunk_raw_size,
+        )
+        .unwrap();
+        let err = Af2Sender::from_manifest_streamed_checked(
+            manifest,
+            vec![
+                (KIND_FILE, "cached.bin".to_string(), 6),
+                (KIND_FILE, "new.bin".to_string(), 3),
+            ],
+            SenderConfig {
+                chunk_raw_size,
+                ..SenderConfig::default()
+            },
+        )
+        .err()
+        .expect("a streamed cache must not silently omit selected items");
+        assert!(
+            err.to_string().contains("selected item count 2"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

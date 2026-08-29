@@ -424,10 +424,11 @@ object ContentStore {
                     bundleId = null
                     bundleTitle = null
                 }
-                putBytes(
-                    ctx, name, f.readBytes(),
+                putFile(
+                    ctx, name, f,
                     crcHex = crcHex, crcUnknown = crcUnknown, kind = kind,
                     bundleId = bundleId, bundleTitle = bundleTitle,
+                    expectedSize = f.length(),
                 )
             } catch (e: Exception) {
                 Log.w(TAG, "migrate skip ${f.name}", e)

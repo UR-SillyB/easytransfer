@@ -205,8 +205,10 @@ std::vector<DecodeResult> DecodeMultiRegions(
             static_cast<double>(qr_side) * margin_fraction));
         const int32_t expanded_x0 = std::max(0, min_x - margin);
         const int32_t expanded_y0 = std::max(0, min_y - margin);
-        const int32_t expanded_x1 = std::min(width, max_x + margin);
-        const int32_t expanded_y1 = std::min(height, max_y + margin);
+        const int32_t expanded_x1 = static_cast<int32_t>(std::min<int64_t>(
+            width, static_cast<int64_t>(max_x) + margin));
+        const int32_t expanded_y1 = static_cast<int32_t>(std::min<int64_t>(
+            height, static_cast<int64_t>(max_y) + margin));
         const int32_t side = std::min(
             expanded_x1 - expanded_x0,
             expanded_y1 - expanded_y0);
@@ -214,8 +216,10 @@ std::vector<DecodeResult> DecodeMultiRegions(
             continue;
         }
 
-        const int32_t center_x = (expanded_x0 + expanded_x1) / 2;
-        const int32_t center_y = (expanded_y0 + expanded_y1) / 2;
+        const int32_t center_x = static_cast<int32_t>(
+            (static_cast<int64_t>(expanded_x0) + expanded_x1) / 2);
+        const int32_t center_y = static_cast<int32_t>(
+            (static_cast<int64_t>(expanded_y0) + expanded_y1) / 2);
         const int32_t x = std::clamp(center_x - side / 2, 0, width - side);
         const int32_t y = std::clamp(center_y - side / 2, 0, height - side);
         const ZXing::ImageView region = full.cropped(x, y, side, side);

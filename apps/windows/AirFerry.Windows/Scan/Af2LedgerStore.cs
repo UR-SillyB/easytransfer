@@ -12,8 +12,8 @@ namespace AirFerry.Windows.Scan;
 /// (temp + flush + rename) before the first chunk commit. Each later line is
 /// <c>{"c":i}</c> (chunk committed after its bytes were pwrite+fsync'd into the
 /// spill) or <c>{"i":i}</c> (chunk invalidated after a re-verification failure).
-/// A torn tail line fails JSON parsing and is skipped, so the journal never
-/// reports more than what reached the disk.
+/// Only a torn final line is skipped; earlier corruption rejects the candidate,
+/// so the journal never reports more than what reached the disk.
 /// </para>
 /// <para>
 /// Only touched from the pool's serialized ingest callback (under
@@ -22,6 +22,12 @@ namespace AirFerry.Windows.Scan;
 /// </summary>
 public sealed class Af2LedgerStore
 {
+    private const int MaxChunkCount = 131_072;
+    private const long MaxLedgerBytes = 32L * 1024 * 1024;
+    private const int MaxRootFrameBytes = 26 + 2400 + 4;
+    private static readonly HashSet<int> LegalChunkRawSizes =
+        [1 << 20, 2 << 20, 4 << 20, 8 << 20, 16 << 20, 32 << 20];
+
     private readonly string _path;
     public string TransferIdHex { get; private set; } = "";
     public int ChunkRawSize { get; private set; }
@@ -42,70 +48,144 @@ public sealed class Af2LedgerStore
     public bool Reload()
     {
         Completed.Clear();
+        TransferIdHex = "";
+        ChunkRawSize = 0;
+        RootFrameBytes = [];
+        _headerDurable = false;
         if (!File.Exists(_path))
         {
             return false;
         }
-        string[] lines;
+        long originalByteLength = new FileInfo(_path).Length;
+        if (originalByteLength > MaxLedgerBytes) return false;
+        string text;
         try
         {
-            lines = File.ReadAllLines(_path);
+            text = File.ReadAllText(_path);
         }
         catch (IOException)
         {
             return false;
         }
-        bool headerSeen = false;
-        foreach (string line in lines)
+        bool tailTerminated = text.EndsWith('\n');
+        string durableText;
+        if (tailTerminated)
         {
-            if (string.IsNullOrWhiteSpace(line))
-            {
-                continue;
-            }
-            JsonElement o;
+            durableText = text;
+        }
+        else
+        {
+            int lastNewline = text.LastIndexOf('\n');
+            if (lastNewline < 0) return false;
+            durableText = text[..(lastNewline + 1)];
+        }
+        var records = durableText.Split('\n').ToList();
+        if (records.Count > 0 && records[^1].Length == 0)
+            records.RemoveAt(records.Count - 1);
+        // Blank physical records are corruption, not ignorable whitespace.
+        // Only a malformed final fragment without its newline can be a torn
+        // append; accepting a newline-terminated bad record can hide an
+        // invalidation and resurrect corrupt spill bytes.
+        if (records.Count == 0 || records.Any(string.IsNullOrWhiteSpace)) return false;
+
+        JsonElement header;
+        try
+        {
+            using JsonDocument doc = JsonDocument.Parse(records[0]);
+            header = doc.RootElement.Clone();
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+        if (header.ValueKind != JsonValueKind.Object) return false;
+        string? fileTid = TransferIdFromLedgerName(Path.GetFileName(_path));
+        JsonProperty[] headerProperties = header.EnumerateObject().ToArray();
+        string parsedTid = header.TryGetProperty("tid", out JsonElement tid) &&
+            tid.ValueKind == JsonValueKind.String
+            ? tid.GetString() ?? "" : "";
+        int parsedChunkRawSize = header.TryGetProperty("crs", out JsonElement crs) &&
+            crs.TryGetInt32(out int crsValue) ? crsValue : 0;
+        string rootHex = header.TryGetProperty("root", out JsonElement root) &&
+            root.ValueKind == JsonValueKind.String
+            ? root.GetString() ?? "" : "";
+        byte[] parsedRoot = rootHex.Length <= MaxRootFrameBytes * 2
+            ? HexToBytes(rootHex) : [];
+        if (headerProperties.Length != 4 ||
+            !header.TryGetProperty("v", out JsonElement version) ||
+            !version.TryGetInt32(out int versionValue) || versionValue != 1 ||
+            fileTid is null || !string.Equals(parsedTid, fileTid, StringComparison.Ordinal) ||
+            !LegalChunkRawSizes.Contains(parsedChunkRawSize) ||
+            parsedRoot.Length == 0)
+        {
+            return false;
+        }
+
+        var parsedCompleted = new SortedSet<int>();
+        for (int position = 1; position < records.Count; position++)
+        {
+            JsonElement record;
             try
             {
-                using JsonDocument doc = JsonDocument.Parse(line);
-                o = doc.RootElement.Clone();
+                using JsonDocument doc = JsonDocument.Parse(records[position]);
+                record = doc.RootElement.Clone();
             }
             catch (JsonException)
             {
-                continue; // torn tail line from a mid-write crash
+                return false;
             }
-            if (!headerSeen)
+            JsonProperty[] properties = record.ValueKind == JsonValueKind.Object
+                ? record.EnumerateObject().ToArray() : [];
+            if (properties.Length != 1 ||
+                !properties[0].Value.TryGetInt32(out int index) ||
+                index < 0 || index >= MaxChunkCount)
             {
-                if (!o.TryGetProperty("v", out _))
-                {
-                    continue;
-                }
-                TransferIdHex = o.TryGetProperty("tid", out JsonElement tid) ? tid.GetString() ?? "" : "";
-                ChunkRawSize = o.TryGetProperty("crs", out JsonElement crs) && crs.TryGetInt32(out int crsVal)
-                    ? crsVal : 0;
-                RootFrameBytes = o.TryGetProperty("root", out JsonElement root)
-                    ? HexToBytes(root.GetString() ?? "") : Array.Empty<byte>();
-                headerSeen = true;
-                continue;
+                return false;
             }
-            if (o.TryGetProperty("c", out JsonElement c) && c.TryGetInt32(out int ci))
+            if (properties[0].NameEquals("c"))
             {
-                Completed.Add(ci);
+                parsedCompleted.Add(index);
             }
-            if (o.TryGetProperty("i", out JsonElement inv) && inv.TryGetInt32(out int ii))
+            else if (properties[0].NameEquals("i"))
             {
-                Completed.Remove(ii);
+                parsedCompleted.Remove(index);
+            }
+            else return false;
+        }
+        if (!tailTerminated)
+        {
+            // A newline is the commit delimiter. Drop even a complete JSON
+            // object when that delimiter was torn, then fsync the repaired
+            // prefix before this resumed store is allowed to append again.
+            try
+            {
+                long durableByteLength = Encoding.UTF8.GetByteCount(durableText);
+                using var stream = new FileStream(
+                    _path, FileMode.Open, FileAccess.Write, FileShare.None);
+                if (stream.Length != originalByteLength) return false;
+                stream.SetLength(durableByteLength);
+                stream.Flush(flushToDisk: true);
+            }
+            catch (Exception)
+            {
+                return false;
             }
         }
         // A journal that reloads with a valid header is durable by definition —
         // resumed transfers keep appending to it.
-        _headerDurable = headerSeen &&
-            !string.IsNullOrEmpty(TransferIdHex) &&
-            RootFrameBytes.Length > 0;
-        return _headerDurable;
+        TransferIdHex = parsedTid;
+        ChunkRawSize = parsedChunkRawSize;
+        RootFrameBytes = parsedRoot;
+        Completed.UnionWith(parsedCompleted);
+        _headerDurable = true;
+        return true;
     }
 
     /// <summary>Append one commit event (after the chunk was spilled + flushed).</summary>
     public void Commit(int index)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(index);
+        if (index >= MaxChunkCount) throw new ArgumentOutOfRangeException(nameof(index));
         if (!_headerDurable)
             throw new IOException("AF2 ledger header is not durable");
         AppendLine($"{{\"c\":{index}}}");
@@ -115,6 +195,8 @@ public sealed class Af2LedgerStore
     /// <summary>Append one invalidate event (after a re-verification failure).</summary>
     public void Invalidate(int index)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(index);
+        if (index >= MaxChunkCount) throw new ArgumentOutOfRangeException(nameof(index));
         if (!_headerDurable)
             throw new IOException("AF2 ledger header is not durable");
         AppendLine($"{{\"i\":{index}}}");
@@ -134,6 +216,7 @@ public sealed class Af2LedgerStore
     public void Discard()
     {
         try { File.Delete(_path); } catch (IOException) { }
+        _headerDurable = false;
     }
 
     /// <summary>Delete this journal and its same-transfer spill backing.</summary>
@@ -269,8 +352,11 @@ public sealed class Af2LedgerStore
     public static Af2LedgerStore Create(
         string dir, string transferIdHex, int chunkRawSize, byte[] rootFrameBytes)
     {
-        string id = string.IsNullOrEmpty(transferIdHex) ? "session" : transferIdHex;
-        string path = Path.Combine(dir, $"af2-{id}.ledger.jsonl");
+        if (!IsSafeTransferId(transferIdHex)) throw new ArgumentException("Invalid AF2 transfer id", nameof(transferIdHex));
+        if (!LegalChunkRawSizes.Contains(chunkRawSize)) throw new ArgumentOutOfRangeException(nameof(chunkRawSize));
+        if (rootFrameBytes.Length == 0 || rootFrameBytes.Length > MaxRootFrameBytes)
+            throw new ArgumentException("Invalid AF2 ROOT frame", nameof(rootFrameBytes));
+        string path = Path.Combine(dir, $"af2-{transferIdHex}.ledger.jsonl");
         try { File.Delete(path); } catch (IOException) { }
         string header = JsonSerializer.Serialize(new
         {
@@ -300,7 +386,7 @@ public sealed class Af2LedgerStore
         {
             TransferIdHex = transferIdHex,
             ChunkRawSize = chunkRawSize,
-            RootFrameBytes = rootFrameBytes,
+            RootFrameBytes = rootFrameBytes.ToArray(),
             _headerDurable = true,
         };
     }
@@ -324,4 +410,18 @@ public sealed class Af2LedgerStore
         try { return Convert.FromHexString(s); }
         catch (FormatException) { return Array.Empty<byte>(); }
     }
+
+    private static string? TransferIdFromLedgerName(string name)
+    {
+        const string prefix = "af2-";
+        const string suffix = ".ledger.jsonl";
+        if (!name.StartsWith(prefix, StringComparison.Ordinal) ||
+            !name.EndsWith(suffix, StringComparison.Ordinal)) return null;
+        string id = name[prefix.Length..^suffix.Length];
+        return IsSafeTransferId(id) ? id : null;
+    }
+
+    private static bool IsSafeTransferId(string id) =>
+        id.Length is >= 1 and <= 64 && id.All(c =>
+            char.IsAsciiLetterOrDigit(c) || c is '_' or '-');
 }

@@ -100,14 +100,15 @@ class SenderSessionManager(private val resolver: ContentResolver) {
                     }
                 }
                 // digest finalizes AND destroys the native handle
-                val digest = NativeBridge.blake3Digest(chunkHasher)
                 liveChunkHasher = 0
+                val digest = NativeBridge.blake3Digest(chunkHasher)
                 System.arraycopy(digest, 0, chunkHashes, ci * HASH_BYTES, HASH_BYTES)
             }
             val contentHashes = ByteArray(items.size * HASH_BYTES)
             for (i in items.indices) {
-                val digest = NativeBridge.blake3Digest(itemHashers[i])
+                val digestHandle = itemHashers[i]
                 itemHashers[i] = 0
+                val digest = NativeBridge.blake3Digest(digestHandle)
                 System.arraycopy(digest, 0, contentHashes, i * HASH_BYTES, HASH_BYTES)
             }
             return Prepared(kinds, paths, sizes, contentHashes, chunkHashes, plan)
@@ -127,7 +128,9 @@ class SenderSessionManager(private val resolver: ContentResolver) {
             prepared.contentHashes, prepared.chunkHashes,
             symbolSize, CHUNK_RAW_SIZE, redundancyPct
         )
+        check(h != 0L) { "native sender build returned a null handle" }
         lock.withLock {
+            if (handle != 0L) NativeBridge.senderDestroy(handle)
             handle = h
             this.items = items
             this.plan = prepared.plan
@@ -186,9 +189,15 @@ class SenderSessionManager(private val resolver: ContentResolver) {
         val p = checkNotNull(plan) { "sender not built" }
         if (NativeBridge.senderIsStaged(handle, index)) return
         val raw = assembleChunk(p, index)
-        val rawHasher = NativeBridge.blake3Create()
-        NativeBridge.blake3Update(rawHasher, raw)
-        val rawHash = NativeBridge.blake3Digest(rawHasher)
+        var rawHasher = NativeBridge.blake3Create()
+        val rawHash = try {
+            NativeBridge.blake3Update(rawHasher, raw)
+            val digestHandle = rawHasher
+            rawHasher = 0
+            NativeBridge.blake3Digest(digestHandle)
+        } finally {
+            if (rawHasher != 0L) runCatching { NativeBridge.blake3Digest(rawHasher) }
+        }
         val packed = NativeBridge.encodeChunkBalanced(raw, channelBps, p.chunkCount == 1)
         val codecId = packed[0].toInt() and 0xFF
         val data = packed.copyOfRange(1, packed.size)
@@ -206,21 +215,19 @@ class SenderSessionManager(private val resolver: ContentResolver) {
     }
 
     fun statsJson(): JSONObject? {
-        val h = handle
-        if (h == 0L) return null
-        val s = lock.withLock { NativeBridge.senderStatsJson(h) } ?: return null
+        val s = lock.withLock {
+            if (handle == 0L) null else NativeBridge.senderStatsJson(handle)
+        } ?: return null
         return try { JSONObject(s) } catch (_: Exception) { null }
     }
 
-    fun transferIdHex(): String? {
-        val h = handle
-        return if (h == 0L) null else lock.withLock { NativeBridge.senderTransferIdHex(h) }
+    fun transferIdHex(): String? = lock.withLock {
+        if (handle == 0L) null else NativeBridge.senderTransferIdHex(handle)
     }
 
     /** 1-based broadcast epoch (1 when idle — display only). */
-    fun epoch(): Int {
-        val h = handle
-        return if (h == 0L) 1 else lock.withLock { NativeBridge.senderEpoch(h) }
+    fun epoch(): Int = lock.withLock {
+        if (handle == 0L) 1 else NativeBridge.senderEpoch(handle)
     }
 
     fun destroy() {
