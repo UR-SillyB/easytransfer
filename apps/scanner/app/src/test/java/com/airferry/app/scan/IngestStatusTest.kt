@@ -25,4 +25,15 @@ class IngestStatusTest {
         assertFalse(status.complete)
         assertFalse(status.accepted)
     }
+
+    @Test
+    fun destroyedManagerCannotBeResumed() {
+        val manager = ReceiverSessionManager()
+        manager.destroy()
+
+        // This must return before touching NativeBridge: the unit-test process
+        // deliberately has no Android JNI library loaded.
+        assertFalse(manager.resume(byteArrayOf(1), intArrayOf()))
+        assertFalse(manager.isInitialized)
+    }
 }

@@ -49,9 +49,9 @@ object FileNameUtil {
         // the cut: an orphan low surrogate would land on disk / in share
         // intents as U+FFFD (mirrors FileNameUtil.cs on Windows).
         val cleaned = if (stripped.length > 200) {
-            var start = stripped.length - 200
-            if (Character.isLowSurrogate(stripped[start])) start += 1
-            stripped.substring(start)
+            var end = 200
+            if (Character.isLowSurrogate(stripped[end])) end -= 1
+            stripped.substring(0, end)
         } else {
             stripped
         }
@@ -104,7 +104,8 @@ object FileNameUtil {
             safe to ""
         }
         var i = 1
-        while (File(dir, "$base($i)$ext").exists()) i++
+        while (i < 10_000 && File(dir, "$base($i)$ext").exists()) i++
+        if (i >= 10_000) throw java.io.IOException("目标目录同名文件过多: $safe")
         return File(dir, "$base($i)$ext")
     }
 

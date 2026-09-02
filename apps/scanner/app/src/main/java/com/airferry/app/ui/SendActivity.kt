@@ -39,6 +39,8 @@ import com.airferry.app.send.ChunkPlan
 import com.airferry.app.send.QrBatch
 import com.airferry.app.send.SendItem
 import com.airferry.app.send.SenderSessionManager
+import com.airferry.app.send.uniqueSendDisplayName
+import com.airferry.app.send.validateSendItems
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -90,7 +92,14 @@ class SendActivity : ComponentActivity() {
     private val pickFiles =
         registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
             if (uris.isNullOrEmpty()) return@registerForActivityResult
-            val resolved = uris.mapNotNull { resolveItem(it) }
+            val usedNames = ui.items.mapTo(mutableSetOf()) { item ->
+                java.text.Normalizer.normalize(item.displayName, java.text.Normalizer.Form.NFC)
+            }
+            val resolved = uris.mapNotNull { uri ->
+                resolveItem(uri)?.let { item ->
+                    item.copy(displayName = uniqueSendDisplayName(usedNames, item.displayName))
+                }
+            }
             if (resolved.size < uris.size) {
                 Toast.makeText(this, "部分文件无法读取大小，已跳过", Toast.LENGTH_LONG).show()
             }
@@ -122,7 +131,7 @@ class SendActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        sender.destroy()
+        destroySenderAsync(sender)
         super.onDestroy()
     }
 
@@ -147,41 +156,52 @@ class SendActivity : ComponentActivity() {
     private fun addTextItem(text: String) {
         val bytes = text.toByteArray(Charsets.UTF_8)
         if (bytes.isEmpty()) return
+        val usedNames = ui.items.mapTo(mutableSetOf()) { item ->
+            java.text.Normalizer.normalize(item.displayName, java.text.Normalizer.Form.NFC)
+        }
         ui.items = ui.items + SendItem(
-            SendItem.KIND_UTF8_TEXT, SendItem.DEFAULT_TEXT_NAME,
+            SendItem.KIND_UTF8_TEXT,
+            uniqueSendDisplayName(usedNames, SendItem.DEFAULT_TEXT_NAME),
             bytes.size.toLong(), text = bytes
         )
     }
 
     private fun startSend() {
         if (ui.items.isEmpty()) return
+        val total = try {
+            validateSendItems(ui.items)
+        } catch (e: IllegalArgumentException) {
+            ui.errorText = e.message ?: "所选内容不符合 AF2 发送约束"
+            return
+        }
+        val activeSender = sender
         val preset = PRESETS[ui.presetIndex]
         ui.page = Page.PREPARE
         ui.prepDone = 0
-        ui.prepTotal = ui.items.sumOf { it.size }.coerceAtLeast(1)
+        ui.prepTotal = total
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                val prepared = sender.prepare(ui.items) { done, total ->
+                val prepared = activeSender.prepare(ui.items) { done, total ->
                     // Throttle state writes: Compose only needs ~10 Hz here.
                     if (done == total || done - ui.prepDone > 4 * 1024 * 1024) {
                         ui.prepDone = done
                         ui.prepTotal = total.coerceAtLeast(1)
                     }
                 }
-                sender.build(prepared, ui.items, preset.symbolSize, preset.fps, REDUNDANCY_PCT)
+                activeSender.build(prepared, ui.items, preset.symbolSize, preset.fps, REDUNDANCY_PCT)
                 withContext(Dispatchers.Main) {
                     // The user may have backgrounded the app mid-prepare —
                     // entering play now would stream QRs to an invisible screen.
                     if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
-                        sender.destroy()
+                        replaceAndDestroySender(activeSender)
                         ui.page = Page.SELECT
                         return@withContext
                     }
                     ui.page = Page.PLAY
                     enterPlayMode()
-                    startRenderLoop(preset)
-                    startStatsLoop()
-                    startPrefetchLoop()
+                    startRenderLoop(preset, activeSender)
+                    startStatsLoop(activeSender)
+                    startPrefetchLoop(activeSender)
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -208,15 +228,20 @@ class SendActivity : ComponentActivity() {
         window.attributes = lp
     }
 
-    private fun startRenderLoop(preset: SpeedPreset) {
+    private fun startRenderLoop(preset: SpeedPreset, activeSender: SenderSessionManager) {
         val frameMs = (1000L / preset.fps).coerceAtLeast(8)
         lifecycleScope.launch(Dispatchers.Default) {
             while (isActive && ui.page == Page.PLAY) {
                 val t0 = System.nanoTime()
                 try {
-                    val batch = sender.nextQr(1)
+                    val batch = activeSender.nextQr(1)
                     val frame = renderFrame(batch)
-                    withContext(Dispatchers.Main) { ui.frame = frame }
+                    withContext(Dispatchers.Main) {
+                        // stopPlay swaps the manager before native work already
+                        // in flight necessarily returns. Do not let that stale
+                        // result repopulate the cleared SELECT-page state.
+                        if (ui.page == Page.PLAY && sender === activeSender) ui.frame = frame
+                    }
                 } catch (e: Exception) {
                     withContext(Dispatchers.Main) {
                         // A deliberate stop destroys the session mid-frame —
@@ -249,15 +274,15 @@ class SendActivity : ComponentActivity() {
         return QrFrame(bmp.asImageBitmap(), side, ++frameSeq)
     }
 
-    private fun startStatsLoop() {
+    private fun startStatsLoop(activeSender: SenderSessionManager) {
         lifecycleScope.launch(Dispatchers.Main) {
             while (isActive && ui.page == Page.PLAY) {
-                val s = withContext(Dispatchers.Default) { sender.statsJson() }
-                if (s != null) {
+                val s = withContext(Dispatchers.Default) { activeSender.statsJson() }
+                if (s != null && ui.page == Page.PLAY && sender === activeSender) {
                     val mbps = s.optDouble("throughput_bps") / (1024.0 * 1024.0)
                     val mb = s.optDouble("bytes") / (1024.0 * 1024.0)
                     ui.statsText = "%.1f fps · %.2f MiB/s · 已发 %.1f MiB · 第 %d 轮".format(
-                        s.optDouble("fps"), mbps, mb, sender.epoch()
+                        s.optDouble("fps"), mbps, mb, activeSender.epoch()
                     )
                 }
                 delay(250)
@@ -265,11 +290,11 @@ class SendActivity : ComponentActivity() {
         }
     }
 
-    private fun startPrefetchLoop() {
+    private fun startPrefetchLoop(activeSender: SenderSessionManager) {
         lifecycleScope.launch(Dispatchers.IO) {
             while (isActive && ui.page == Page.PLAY) {
                 try {
-                    sender.prefetchNextChunk()
+                    activeSender.prefetchNextChunk()
                 } catch (_: Exception) {
                     // staging failure surfaces on the render loop's next retry
                 }
@@ -279,11 +304,27 @@ class SendActivity : ComponentActivity() {
     }
 
     private fun stopPlay() {
-        sender.destroy()
+        val activeSender = sender
+        // Stop every loop before waiting for the manager's native-call lock.
+        // The old instance is retired on a daemon thread; a fresh one is ready
+        // immediately if the user starts another send.
+        ui.page = Page.SELECT
+        replaceAndDestroySender(activeSender)
         exitPlayMode()
         ui.frame = null
         ui.statsText = ""
-        ui.page = Page.SELECT
+    }
+
+    private fun replaceAndDestroySender(retiring: SenderSessionManager) {
+        if (sender === retiring) sender = SenderSessionManager(contentResolver)
+        destroySenderAsync(retiring)
+    }
+
+    private fun destroySenderAsync(retiring: SenderSessionManager) {
+        Thread({ retiring.destroy() }, "airferry-sender-destroy").apply {
+            isDaemon = true
+            start()
+        }
     }
 
     override fun onPause() {

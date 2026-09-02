@@ -62,4 +62,38 @@ public class ProgressSnapshotTests
         Assert.False(p.MetaConfirmed);
         Assert.Equal(0, p.SessionMismatchStreak);
     }
+
+    [Fact]
+    public void Parse_OutOfRangeCounters_SaturateInsteadOfThrowing()
+    {
+        // total_symbols is a Rust u32 derived from the attacker-declared
+        // ROOT total_raw_size, and frames_seen is a u64. GetInt32/GetInt64
+        // would throw here, and this parse runs on the DispatcherTimer tick
+        // with no dispatcher-level handler — that is a remote process kill.
+        const string hostile = """
+            {"decoded_symbols":0,"total_symbols":4294967295,"received_symbols":0,
+            "frames_seen":18446744073709551615,"frames_duplicate":0,"frames_corrupt":0,
+            "decoded_blocks":0,"total_blocks":0,"decoded_fraction":0.0,
+            "loss_ratio":0.0,"complete":false}
+            """;
+        var p = ProgressSnapshot.Parse(hostile);
+        Assert.Equal(int.MaxValue, p.TotalSymbols);
+        Assert.Equal(long.MaxValue, p.FramesSeen);
+    }
+
+    [Fact]
+    public void Parse_DroppedCounterSum_SaturatesInsteadOfWrapping()
+    {
+        const string hostile = """
+            {"decoded_symbols":0,"total_symbols":0,"received_symbols":0,
+            "frames_seen":18446744073709551615,
+            "frames_duplicate":18446744073709551615,
+            "frames_corrupt":18446744073709551615,
+            "decoded_blocks":0,"total_blocks":0,"decoded_fraction":0.0,
+            "loss_ratio":1.0,"complete":false}
+            """;
+        var p = ProgressSnapshot.Parse(hostile);
+        Assert.Equal(long.MaxValue, p.FramesDropped);
+        Assert.Equal(long.MaxValue, p.FramesCorrupt);
+    }
 }

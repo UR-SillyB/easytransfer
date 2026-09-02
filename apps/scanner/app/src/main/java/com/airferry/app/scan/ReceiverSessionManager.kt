@@ -162,6 +162,10 @@ class ReceiverSessionManager {
 
     /** Restore session from stored ROOT frame bytes + completed chunk indices (§12 resume). */
     fun resume(rootFrameBytes: ByteArray, completedIndices: IntArray): Boolean {
+        // Match ingest(): teardown is terminal for this manager instance. A
+        // late recovery callback must not recreate a native receiver after
+        // the owning Activity has scheduled/done destruction.
+        if (destroyed) return false
         if (!initialized) {
             handle = NativeBridge.receiverCreate(0L, 0L)
             initialized = handle != 0L
@@ -281,7 +285,7 @@ class ReceiverSessionManager {
     fun fileName(): String {
         val snap = snapshot()
         val nonDir = snap.entries.filter { it.kind != 3 }
-        if (nonDir.size == 1) return nonDir[0].path
+        if (nonDir.size == 1) return nonDir[0].savePath
         if (nonDir.size > 1) return "多文件传输包 (${nonDir.size} 项)"
         if (snap.entryCount > 1) return "多文件传输包 (${snap.entryCount} 项)"
         return "文件传输"
@@ -326,21 +330,22 @@ class ReceiverSessionManager {
      * thread right after [ingest] reported `chunkReady` (the ingest path is
      * serialized, so the drain cannot race another ingest).
      */
-    fun drainLastChunk(sink: (index: Int, chunkRawSize: Int, bytes: ByteArray) -> Unit) {
+    fun drainLastChunk(
+        sink: (index: Int, chunkRawSize: Int, bytes: ByteArray) -> Unit,
+    ): Boolean {
         val index = lastChunkIndex()
-        if (index < 0) return
+        if (index < 0) return false
         val chunkRawSize = snapshot().chunkRawSize
         if (chunkRawSize <= 0) {
-            // Geometry unknown (snapshot JNI/JSON failure before any good
-            // read): the spill sink cannot compute offsets without it and its
-            // failure would be misread as a DISK failure, permanently pausing
-            // reception. Leave the chunk resident; the next ChunkReady drains
-            // it once a good snapshot is available.
-            return
+            // Geometry unknown (snapshot JNI/JSON failure). Leave the chunk
+            // resident and report failure so the caller can stop ingest;
+            // ChunkReady is edge-triggered and a later frame is not guaranteed
+            // to announce this same resident chunk again.
+            return false
         }
-        val bytes = assembleChunk(index) ?: return
+        val bytes = assembleChunk(index) ?: return false
         sink(index, chunkRawSize, bytes)
-        forgetChunk(index)
+        return forgetChunk(index)
     }
 
     fun destroy() {

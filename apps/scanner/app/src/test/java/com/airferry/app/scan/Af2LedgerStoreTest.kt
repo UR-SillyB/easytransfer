@@ -27,13 +27,35 @@ class Af2LedgerStoreTest {
     fun createWritesHeaderAtomically() {
         val store = Af2LedgerStore.create(tmp.root, "tid-a", chunkRawSize, root)
         assertEquals("tid-a", store.transferIdHex)
+        assertTrue(store.recoveryId.isNotBlank())
         assertEquals(chunkRawSize, store.chunkRawSize)
         assertArrayEquals(root, store.rootFrameBytes)
         // Reload from disk as a fresh process would.
         val reloaded = Af2LedgerStore.loadMostRecent(tmp.root)!!
         assertEquals("tid-a", reloaded.transferIdHex)
+        assertEquals(store.recoveryId, reloaded.recoveryId)
         assertEquals(chunkRawSize, reloaded.chunkRawSize)
         assertArrayEquals(root, reloaded.rootFrameBytes)
+    }
+
+    @Test
+    fun sameTransferCreateReplacesDurableLedgerOnlyAfterNewHeaderIsReady() {
+        val old = Af2LedgerStore.create(tmp.root, "tid-relock", chunkRawSize, root)
+        val oldRecoveryId = old.recoveryId
+        old.commit(4)
+        val replacementRoot = ByteArray(30) { 0x42 }
+
+        Af2LedgerStore.create(tmp.root, "tid-relock", chunkRawSize, replacementRoot)
+
+        val reloaded = Af2LedgerStore.loadMostRecent(tmp.root)!!
+        assertArrayEquals(replacementRoot, reloaded.rootFrameBytes)
+        assertTrue(reloaded.recoveryId != oldRecoveryId)
+        assertArrayEquals(intArrayOf(), reloaded.completedIndices)
+        assertTrue(
+            tmp.root.listFiles()?.none {
+                it.name.startsWith("af2-tid-relock.ledger.jsonl.") && it.name.endsWith(".tmp")
+            } == true
+        )
     }
 
     @Test
@@ -99,6 +121,30 @@ class Af2LedgerStoreTest {
             "{\"v\":1,\"tid\":\"tid-other\",\"crs\":$chunkRawSize,\"root\":\"$rootHex\"}\n"
         )
         assertNull(Af2LedgerStore.loadMostRecent(tmp.root))
+    }
+
+    @Test
+    fun orphanSweepDoesNotDeleteNonAf2LedgerFiles() {
+        val unrelated = File(tmp.root, "notes.ledger.jsonl").apply { writeText("private data") }
+        val malformedNamespace = File(tmp.root, "af2-bad id.ledger.jsonl").apply {
+            writeText("private data")
+        }
+
+        Af2LedgerStore.sweepOrphanPartials(tmp.root)
+
+        assertTrue(unrelated.isFile)
+        assertTrue(malformedNamespace.isFile)
+    }
+
+    @Test
+    fun legacyHeaderUsesTransferIdAsRecoveryFallback() {
+        val rootHex = root.joinToString("") { "%02x".format(it) }
+        File(tmp.root, "af2-tid-legacy.ledger.jsonl").writeText(
+            "{\"v\":1,\"tid\":\"tid-legacy\",\"crs\":$chunkRawSize,\"root\":\"$rootHex\"}\n"
+        )
+
+        val reloaded = Af2LedgerStore.loadMostRecent(tmp.root)!!
+        assertEquals("tid-legacy", reloaded.recoveryId)
     }
 
     @Test

@@ -11,7 +11,17 @@ export function normalizeSenderPath(raw: string, fallback = "unnamed"): string {
   if (parts.some((part) => part === "..")) {
     throw new Error(`非法相对路径（包含 ..）: ${raw}`)
   }
-  return parts.join("/") || fallback
+  const path = parts.join("/") || fallback
+  if ([...path].some((c) => c.codePointAt(0)! < 0x20)) {
+    throw new Error(`非法相对路径（包含控制字符）: ${raw}`)
+  }
+  if (parts.some((part) => utf8Length(part) > MAX_COMPONENT_BYTES)) {
+    throw new Error(`相对路径单段超过 ${MAX_COMPONENT_BYTES} 字节: ${raw}`)
+  }
+  if (utf8Length(path) > MAX_PATH_BYTES) {
+    throw new Error(`相对路径超过 ${MAX_PATH_BYTES} 字节: ${raw}`)
+  }
+  return path
 }
 
 /**
@@ -52,7 +62,49 @@ export function uniqueSenderPath(used: Set<string>, requestedPath: string): stri
   const dot = name.lastIndexOf(".")
   const stem = dot > 0 ? name.slice(0, dot) : name
   const ext = dot > 0 ? name.slice(dot) : ""
+  const componentBudget = Math.min(MAX_COMPONENT_BYTES, MAX_PATH_BYTES - utf8Length(dir))
   let i = 1
-  while (used.has(`${dir}${stem} (${i})${ext}`)) i++
-  return `${dir}${stem} (${i})${ext}`
+  let candidate = ""
+  do {
+    candidate = `${dir}${fitComponent(stem, ` (${i})`, ext, componentBudget)}`
+    i++
+  } while (used.has(candidate))
+  return candidate
+}
+
+const MAX_COMPONENT_BYTES = 255
+const MAX_PATH_BYTES = 1024
+
+function fitComponent(
+  stem: string,
+  suffix: string,
+  extension: string,
+  maxBytes: number
+): string {
+  const suffixBytes = utf8Length(suffix)
+  const extensionBytes = utf8Length(extension)
+  if (suffixBytes > maxBytes) {
+    throw new Error("相对路径已达 1024 字节，无法为重名文件添加唯一后缀")
+  }
+  if (suffixBytes + extensionBytes <= maxBytes) {
+    return `${utf8Prefix(stem, maxBytes - suffixBytes - extensionBytes)}${suffix}${extension}`
+  }
+  return `${utf8Prefix(stem + extension, maxBytes - suffixBytes)}${suffix}`
+}
+
+function utf8Length(value: string): number {
+  return new TextEncoder().encode(value).byteLength
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return ""
+  let usedBytes = 0
+  let out = ""
+  for (const codePoint of value) {
+    const bytes = utf8Length(codePoint)
+    if (usedBytes + bytes > maxBytes) break
+    usedBytes += bytes
+    out += codePoint
+  }
+  return out
 }

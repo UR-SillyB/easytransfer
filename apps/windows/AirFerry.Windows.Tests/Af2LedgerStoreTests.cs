@@ -31,6 +31,7 @@ public class Af2LedgerStoreTests
         {
             var store = Af2LedgerStore.Create(dir, "tid-a", ChunkRawSize, RootFrame);
             Assert.Equal("tid-a", store.TransferIdHex);
+            Assert.False(string.IsNullOrWhiteSpace(store.RecoveryId));
             Assert.Equal(ChunkRawSize, store.ChunkRawSize);
             Assert.Equal(RootFrame, store.RootFrameBytes);
 
@@ -38,8 +39,35 @@ public class Af2LedgerStoreTests
             var reloaded = Af2LedgerStore.LoadMostRecent(dir);
             Assert.NotNull(reloaded);
             Assert.Equal("tid-a", reloaded!.TransferIdHex);
+            Assert.Equal(store.RecoveryId, reloaded.RecoveryId);
             Assert.Equal(ChunkRawSize, reloaded.ChunkRawSize);
             Assert.Equal(RootFrame, reloaded.RootFrameBytes);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SameTransferCreateReplacesDurableLedgerOnlyAfterNewHeaderIsReady()
+    {
+        string dir = TempRoot();
+        try
+        {
+            var old = Af2LedgerStore.Create(dir, "tid-relock", ChunkRawSize, RootFrame);
+            string oldRecoveryId = old.RecoveryId;
+            old.Commit(4);
+            byte[] replacementRoot = Enumerable.Repeat((byte)0x42, 30).ToArray();
+
+            Af2LedgerStore.Create(dir, "tid-relock", ChunkRawSize, replacementRoot);
+
+            var reloaded = Af2LedgerStore.LoadMostRecent(dir)!;
+            Assert.Equal(replacementRoot, reloaded.RootFrameBytes);
+            Assert.NotEqual(oldRecoveryId, reloaded.RecoveryId);
+            Assert.Empty(reloaded.CompletedIndices);
+            Assert.Empty(Directory.EnumerateFiles(
+                dir, "af2-tid-relock.ledger.jsonl.*.tmp"));
         }
         finally
         {
@@ -162,6 +190,25 @@ public class Af2LedgerStoreTests
             File.WriteAllText(Path.Combine(dir, "af2-tid-file.ledger.jsonl"),
                 $"{{\"v\":1,\"tid\":\"tid-other\",\"crs\":{ChunkRawSize},\"root\":\"{rootHex}\"}}\n");
             Assert.Null(Af2LedgerStore.LoadMostRecent(dir));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void LegacyHeaderUsesTransferIdAsRecoveryFallback()
+    {
+        string dir = TempRoot();
+        try
+        {
+            string rootHex = Convert.ToHexString(RootFrame).ToLowerInvariant();
+            File.WriteAllText(Path.Combine(dir, "af2-tid-legacy.ledger.jsonl"),
+                $"{{\"v\":1,\"tid\":\"tid-legacy\",\"crs\":{ChunkRawSize},\"root\":\"{rootHex}\"}}\n");
+
+            Af2LedgerStore reloaded = Af2LedgerStore.LoadMostRecent(dir)!;
+            Assert.Equal("tid-legacy", reloaded.RecoveryId);
         }
         finally
         {
@@ -376,6 +423,28 @@ public class Af2LedgerStoreTests
             Assert.False(File.Exists(orphan));
             Assert.False(File.Exists(badJournal));
             Assert.False(File.Exists(badPartial));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SweepOrphanPartialsDoesNotDeleteFilesOutsideAf2Namespace()
+    {
+        string dir = TempRoot();
+        try
+        {
+            string unrelated = Path.Combine(dir, "notes.ledger.jsonl");
+            string malformedNamespace = Path.Combine(dir, "af2-bad id.ledger.jsonl");
+            File.WriteAllText(unrelated, "private data");
+            File.WriteAllText(malformedNamespace, "private data");
+
+            Af2LedgerStore.SweepOrphanPartials(dir);
+
+            Assert.True(File.Exists(unrelated));
+            Assert.True(File.Exists(malformedNamespace));
         }
         finally
         {

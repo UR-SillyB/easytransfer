@@ -39,6 +39,9 @@ class SenderSessionManager(private val resolver: ContentResolver) {
     private val lock = ReentrantLock()
 
     @Volatile
+    private var destroyed = false
+
+    @Volatile
     var handle: Long = 0
         private set
 
@@ -54,6 +57,7 @@ class SenderSessionManager(private val resolver: ContentResolver) {
     /** Prep-pass file sources, keyed by item index (segments of one item are
      *  consecutive, so one open per item). Closed at the end of [prepare]. */
     private val prepChannels = HashMap<Int, OpenedItem>()
+    private val prepChannelsLock = Any()
 
     /** An open SAF file: random-access channel + the fd wrapper to release. */
     private class OpenedItem(val channel: FileChannel, val pfd: android.os.ParcelFileDescriptor) :
@@ -74,14 +78,14 @@ class SenderSessionManager(private val resolver: ContentResolver) {
         items: List<SendItem>,
         onProgress: (done: Long, total: Long) -> Unit = { _, _ -> }
     ): Prepared {
-        require(items.isNotEmpty()) { "nothing to send" }
+        check(!destroyed) { "sender manager already destroyed" }
+        val total = validateSendItems(items)
         val kinds = ByteArray(items.size) { items[it].kind.toByte() }
         val paths = Array(items.size) { items[it].displayName }
         val sizes = LongArray(items.size) { items[it].size }
         val planJson = NativeBridge.senderPlanChunks(kinds, paths, sizes, CHUNK_RAW_SIZE)
         val plan = ChunkPlan.parse(planJson)
 
-        val total = items.sumOf { it.size }
         val itemHashers = LongArray(items.size) { NativeBridge.blake3Create() }
         val chunkHashes = ByteArray(plan.chunkCount * HASH_BYTES)
         val slice = ByteArray(SLICE_BYTES)
@@ -130,6 +134,10 @@ class SenderSessionManager(private val resolver: ContentResolver) {
         )
         check(h != 0L) { "native sender build returned a null handle" }
         lock.withLock {
+            if (destroyed) {
+                NativeBridge.senderDestroy(h)
+                throw IllegalStateException("sender manager was destroyed during build")
+            }
             if (handle != 0L) NativeBridge.senderDestroy(handle)
             handle = h
             this.items = items
@@ -199,9 +207,12 @@ class SenderSessionManager(private val resolver: ContentResolver) {
             if (rawHasher != 0L) runCatching { NativeBridge.blake3Digest(rawHasher) }
         }
         val packed = NativeBridge.encodeChunkBalanced(raw, channelBps, p.chunkCount == 1)
+        check(packed.isNotEmpty()) { "native chunk encoder returned an empty payload" }
         val codecId = packed[0].toInt() and 0xFF
         val data = packed.copyOfRange(1, packed.size)
-        NativeBridge.senderStageChunk(handle, index, codecId, data, rawHash)
+        check(NativeBridge.senderStageChunk(handle, index, codecId, data, rawHash)) {
+            "native chunk staging failed without an exception"
+        }
     }
 
     /** Assemble one chunk's raw canonical bytes from its segments. */
@@ -232,6 +243,7 @@ class SenderSessionManager(private val resolver: ContentResolver) {
 
     fun destroy() {
         lock.withLock {
+            destroyed = true
             if (handle != 0L) {
                 NativeBridge.senderDestroy(handle)
                 handle = 0
@@ -261,6 +273,7 @@ class SenderSessionManager(private val resolver: ContentResolver) {
             var pos = seg.start.toInt()
             val end = (seg.start + seg.len).toInt()
             while (pos < end) {
+                if (destroyed) throw java.io.IOException("sender manager destroyed during prepare")
                 val n = minOf(slice.size, end - pos)
                 System.arraycopy(text, pos, slice, 0, n)
                 cb(slice, n)
@@ -268,16 +281,18 @@ class SenderSessionManager(private val resolver: ContentResolver) {
             }
             return
         }
-        val opened = prepChannels.getOrPut(seg.item) { openItem(item) }
+        val opened = prepChannel(seg.item, item)
         val channel = opened.channel
         channel.position(seg.start)
         var remaining = seg.len
         val nioBuf = java.nio.ByteBuffer.wrap(slice)
         while (remaining > 0) {
+            if (destroyed) throw java.io.IOException("sender manager destroyed during prepare")
             nioBuf.clear()
             nioBuf.limit(minOf(slice.size.toLong(), remaining).toInt())
             val n = channel.read(nioBuf)
             if (n < 0) throw java.io.IOException("EOF in ${item.displayName}: ${seg.len - remaining}/${seg.len}")
+            if (n == 0) throw java.io.IOException("zero-byte read in ${item.displayName}")
             cb(slice, n)
             remaining -= n
         }
@@ -298,6 +313,7 @@ class SenderSessionManager(private val resolver: ContentResolver) {
             while (read < len) {
                 val n = channel.read(nioBuf)
                 if (n < 0) throw java.io.IOException("EOF in ${item.displayName}: $read/$len")
+                if (n == 0) throw java.io.IOException("zero-byte read in ${item.displayName}")
                 read += n
             }
             return read
@@ -312,9 +328,37 @@ class SenderSessionManager(private val resolver: ContentResolver) {
         return OpenedItem(FileInputStream(pfd.fileDescriptor).channel, pfd)
     }
 
+    /**
+     * Register a prep channel without racing [destroy]. Opening a content URI
+     * can block, so do it outside the monitor; a destroy that wins meanwhile
+     * makes the newly opened descriptor close immediately instead of leaking
+     * it back into an already-drained map.
+     */
+    private fun prepChannel(index: Int, item: SendItem): OpenedItem {
+        synchronized(prepChannelsLock) {
+            check(!destroyed) { "sender manager already destroyed" }
+            prepChannels[index]?.let { return it }
+        }
+        val opened = openItem(item)
+        synchronized(prepChannelsLock) {
+            if (destroyed) {
+                opened.close()
+                throw java.io.IOException("sender manager destroyed while opening ${item.displayName}")
+            }
+            prepChannels[index]?.let { existing ->
+                opened.close()
+                return existing
+            }
+            prepChannels[index] = opened
+            return opened
+        }
+    }
+
     private fun closePrepChannels() {
-        for ((_, opened) in prepChannels) opened.close()
-        prepChannels.clear()
+        val opened = synchronized(prepChannelsLock) {
+            prepChannels.values.toList().also { prepChannels.clear() }
+        }
+        for (channel in opened) channel.close()
     }
 
     companion object {

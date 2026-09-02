@@ -47,7 +47,7 @@ public readonly record struct ProgressSnapshot(
             // (no frames_dropped key). Treat "dropped" as their union — every
             // seen frame that contributed no new data — which is what the
             // loss_ratio already reflects. Same convention as the Kotlin side.
-            FramesDropped: framesDuplicate + framesCorrupt,
+            FramesDropped: SaturatingAdd(framesDuplicate, framesCorrupt),
             FramesCorrupt: framesCorrupt,
             DecodedBlocks: root.GetInt("decoded_blocks"),
             TotalBlocks: root.GetInt("total_blocks"),
@@ -57,21 +57,54 @@ public readonly record struct ProgressSnapshot(
             MetaConfirmed: root.GetBool("meta_confirmed", defaultValue: false),
             SessionMismatchStreak: root.GetInt("session_mismatch_streak", defaultValue: 0));
     }
+
+    private static long SaturatingAdd(long left, long right)
+    {
+        if (right > 0 && left > long.MaxValue - right) return long.MaxValue;
+        if (right < 0 && left < long.MinValue - right) return long.MinValue;
+        return left + right;
+    }
 }
 
 internal static class JsonElementExtensions
 {
-    public static int GetInt(this JsonElement e, string name, int defaultValue = 0) =>
-        e.TryGetProperty(name, out JsonElement p) && p.ValueKind == JsonValueKind.Number
-            ? p.GetInt32() : defaultValue;
+    // The progress JSON carries Rust u32/u64 counters derived from an
+    // attacker-declared ROOT frame (total_symbols follows total_raw_size).
+    // GetInt32/GetInt64 THROW on a number past their range, and this parse
+    // runs inside the DispatcherTimer tick with no dispatcher-level handler —
+    // one crafted ROOT frame would kill the process. Saturate instead: a
+    // pinned-maximum progress bar is a display artefact, a crash is not.
+    public static int GetInt(this JsonElement e, string name, int defaultValue = 0)
+    {
+        if (!e.TryGetProperty(name, out JsonElement p) || p.ValueKind != JsonValueKind.Number)
+        {
+            return defaultValue;
+        }
+        if (p.TryGetInt32(out int value))
+        {
+            return value;
+        }
+        // Out of int range: clamp to the nearer bound rather than throwing.
+        return p.TryGetInt64(out long wide) && wide < 0 ? int.MinValue : int.MaxValue;
+    }
 
-    public static long GetLong(this JsonElement e, string name, long defaultValue = 0) =>
-        e.TryGetProperty(name, out JsonElement p) && p.ValueKind == JsonValueKind.Number
-            ? p.GetInt64() : defaultValue;
+    public static long GetLong(this JsonElement e, string name, long defaultValue = 0)
+    {
+        if (!e.TryGetProperty(name, out JsonElement p) || p.ValueKind != JsonValueKind.Number)
+        {
+            return defaultValue;
+        }
+        if (p.TryGetInt64(out long value))
+        {
+            return value;
+        }
+        // A u64 past long.MaxValue (or any other unrepresentable number).
+        return p.TryGetDouble(out double approx) && approx < 0 ? long.MinValue : long.MaxValue;
+    }
 
     public static double GetDouble(this JsonElement e, string name, double defaultValue = 0.0) =>
         e.TryGetProperty(name, out JsonElement p) && p.ValueKind == JsonValueKind.Number
-            ? p.GetDouble() : defaultValue;
+            ? (p.TryGetDouble(out double value) ? value : defaultValue) : defaultValue;
 
     public static bool GetBool(this JsonElement e, string name, bool defaultValue = false) =>
         e.TryGetProperty(name, out JsonElement p) && p.ValueKind is JsonValueKind.True or JsonValueKind.False

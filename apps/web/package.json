@@ -15,6 +15,7 @@
     "dev": "vite",
     "dev:receiver": "vite --config vite.receiver.config.ts",
     "typecheck": "tsc --noEmit",
+    "pretest": "node -e \"const fs=require('fs');if(!fs.existsSync('test')||!fs.readdirSync('test').some(f=>f.endsWith('.test.mjs')))throw new Error('no *.test.mjs found under test/ — node --test exits 0 on zero matches, so this gate would pass silently')\"",
     "test": "node --test",
     "wasm": "node scripts/build-wasm.cjs",
     "build": "vite build",

@@ -61,6 +61,14 @@ private val Success = Color(0xFF22C55E)
 
 class ScanActivity : ComponentActivity() {
 
+    /** Publication failures need different ownership handling depending on
+     * whether the complete staged files already have a durable retry manifest. */
+    private class RecoveryPublicationException(
+        message: String,
+        val durableStage: Boolean,
+        cause: Throwable,
+    ) : java.io.IOException(message, cause)
+
     private var session = ReceiverSessionManager()
     /**
      * On-disk staging for completed chunks (bounded-memory ledger): chunks are
@@ -668,6 +676,7 @@ class ScanActivity : ComponentActivity() {
                 // dropped as already done. Invalidate immediately so the next
                 // sender epoch can actually re-supply it.
                 session.invalidateChunk(i)
+                spill.invalidate(i)
                 led.invalidate(i)
                 Log.w(TAG, "resumed chunk $i missing/corrupt; invalidated for re-supply")
             }
@@ -709,32 +718,38 @@ class ScanActivity : ComponentActivity() {
             reverifyResumedChunks()
         }
         if (status.chunkReady) {
-            val snap = session.snapshot()
-            if (snap.transferIdHex.isEmpty() || snap.chunkRawSize <= 0) {
-                // Transient snapshot failure (JNI/JSON): no identity/geometry
-                // for the spill. Skip this frame's drain — the chunk stays
-                // resident and the next ChunkReady retries. Forcing the drain
-                // here would write junk spill files or be misread as a DISK
-                // failure, permanently pausing reception.
-                return
-            }
-            val spill = chunkSpill ?: ChunkSpillStore(
-                cacheDir, snap.transferIdHex
-            ).also { chunkSpill = it }
             try {
-                session.drainLastChunk { index, chunkRawSize, bytes ->
-                    spill.write(index, chunkRawSize, bytes)
-                    // §12 commit order: chunk bytes are fsync'd into the spill
-                    // above; only then may the ledger journal record the bit.
+                val snap = session.snapshot()
+                if (
+                    snap.transferIdHex.isEmpty() ||
+                    snap.chunkRawSize <= 0 ||
+                    snap.rootFrameBytes.isEmpty()
+                ) {
+                    throw java.io.IOException("AF2 snapshot unavailable for completed chunk")
+                }
+                val drained = session.drainLastChunk { index, chunkRawSize, bytes ->
+                    // Replace the old same-transfer ledger only after the new
+                    // header is durable. Windows also truncates a fresh spill,
+                    // so constructing it after the header closes the paired
+                    // ledger/spill crash window on both hosts.
                     val led = ledger ?: Af2LedgerStore.create(
                         cacheDir, snap.transferIdHex, snap.chunkRawSize, snap.rootFrameBytes
                     ).also { ledger = it }
+                    val spill = chunkSpill ?: ChunkSpillStore(
+                        cacheDir, snap.transferIdHex
+                    ).also { chunkSpill = it }
+                    spill.write(index, chunkRawSize, bytes)
+                    // §12 commit order: chunk bytes are fsync'd into the spill
+                    // above; only then may the ledger journal record the bit.
                     led.commit(index)
+                }
+                if (!drained) {
+                    throw java.io.IOException("completed AF2 chunk could not be drained")
                 }
             } catch (e: Exception) {
                 // Do not continue decoding into an ever-growing native fallback
-                // when disk space/quota is exhausted. The just-completed chunk
-                // remains resident and the user can free space then restart.
+                // when durable storage or the snapshot/drain bridge fails. The
+                // just-completed chunk remains resident for diagnosis/restart.
                 ingestStopped.set(true)
                 Log.e(TAG, "chunk spill failed; reception paused", e)
                 runOnUiThread {
@@ -824,7 +839,11 @@ class ScanActivity : ComponentActivity() {
             progress.complete -> 100
             progress.metaConfirmed || progress.totalSymbols > 0 -> {
                 if (progress.totalSymbols > 0) {
-                    (progress.receivedSymbols * 100 / progress.totalSymbols).coerceIn(0, 100)
+                    // Widen before scaling: receivedSymbols is an Int and
+                    // `× 100` wraps negative past ~21.5M symbols, which the
+                    // clamp then pins to 0% for the rest of a large transfer.
+                    (progress.receivedSymbols.toLong() * 100 / progress.totalSymbols)
+                        .coerceIn(0L, 100L).toInt()
                 } else {
                     0
                 }
@@ -835,7 +854,8 @@ class ScanActivity : ComponentActivity() {
             progress.receivedSymbols > 0 -> {
                 val estimated = s.estimatedTotalSymbols
                 if (estimated > 0) {
-                    (progress.receivedSymbols * 100 / estimated).coerceIn(0, 15)
+                    (progress.receivedSymbols.toLong() * 100 / estimated)
+                        .coerceIn(0L, 15L).toInt()
                 } else {
                     0
                 }
@@ -984,7 +1004,16 @@ class ScanActivity : ComponentActivity() {
                             intent?.let { runOnUiThread { startActivity(it) } }
                         } catch (e: Exception) {
                             clearRecoveryStage()
-                            resetReceiverAfterRecoveryFailure(poolAtEnqueue)
+                            if (e is RecoveryPublicationException && !e.durableStage) {
+                                // Manifest persistence failed, so the complete
+                                // stage has no restart owner. Keep the native
+                                // session + spill/ledger and retry on a later
+                                // frame instead of deleting the only copy.
+                                ingestStopped.set(false)
+                                completedHandled = false
+                            } else {
+                                resetReceiverAfterRecoveryFailure(poolAtEnqueue)
+                            }
                             runOnUiThread {
                                 Toast.makeText(
                                     this,
@@ -1040,11 +1069,37 @@ class ScanActivity : ComponentActivity() {
 
     private fun stageFromLedger(displayName: String): Intent? {
         updateRecoveryStage("正在组装数据…")
-        // Entry staging is exclusive to this recovery pass (ingest lock);
-        // wipe orphans a process kill may have left from a previous staging.
-        val stageDir = java.io.File(cacheDir, "af2-entry-stage")
-        if (stageDir.exists()) stageDir.deleteRecursively()
-        stageDir.mkdirs()
+        // Give every recovery pass its own directory. A previous index-commit
+        // failure can leave the only complete forensic/retry copy here; wiping
+        // one shared directory at the next scan silently destroyed that copy.
+        val stageRoot = java.io.File(cacheDir, "af2-entry-stage")
+        val stageDir = com.airferry.app.scan.PendingRecoveryStore.createStageDirectory(cacheDir)
+        var preserveRecoveryStage = false
+        fun markRecoveryStagePreserved(
+            requests: List<com.airferry.app.scan.ContentStore.PutFileRequest>,
+        ) {
+            if (preserveRecoveryStage) return
+            try {
+                com.airferry.app.scan.PendingRecoveryStore.persist(stageDir, requests)
+                preserveRecoveryStage = true
+            } catch (e: Exception) {
+                throw RecoveryPublicationException(
+                    "无法持久化接收文件的待提交标记: ${stageDir.absolutePath}",
+                    durableStage = false,
+                    cause = e,
+                )
+            }
+        }
+        fun releaseRecoveryStage() {
+            preserveRecoveryStage = false
+            try {
+                java.io.File(
+                    stageDir,
+                    com.airferry.app.scan.PendingRecoveryStore.MANIFEST_NAME,
+                ).delete()
+            } catch (_: Exception) {}
+        }
+        try {
         val snapshot = session.snapshot()
 
         // Prefer the on-disk chunk spill: every completed chunk was pwrite'd
@@ -1101,6 +1156,7 @@ class ScanActivity : ComponentActivity() {
                 }
                 if (bytes == null) {
                     session.invalidateChunk(i)
+                    spill.invalidate(i)
                     ledger?.invalidate(i)
                     badChunks.add(i)
                     finalVerifyUsable = false
@@ -1114,6 +1170,7 @@ class ScanActivity : ComponentActivity() {
                     // trigger a full resetReceiverAfterRecoveryFailure and a
                     // complete re-receive.
                     session.invalidateChunk(i)
+                    spill.invalidate(i)
                     // Persist the same invalidation. If the app exits before
                     // the sender re-supplies this chunk, §12 resume must not
                     // resurrect the corrupt spill range as completed.
@@ -1150,6 +1207,13 @@ class ScanActivity : ComponentActivity() {
 
         val nonDirEntries = snapshot.entries.filter { it.kind != 3 } // 3 = DIRECTORY
         val store = com.airferry.app.scan.ContentStore
+        val recoveryKey = ledger
+            ?.takeIf { it.transferIdHex == snapshot.transferIdHex }
+            ?.recoveryId
+            ?.takeIf { it.isNotBlank() }
+            ?: snapshot.transferIdHex.ifBlank { snapshot.contentIdHex }
+        require(recoveryKey.isNotBlank()) { "恢复快照缺少 AF2 传输标识" }
+        fun stableEntryId(ordinal: Int) = "af2-$recoveryKey-$ordinal"
 
         // Manifest offsets/sizes are u64 and cannot be trusted: bounds-check in
         // the Long domain before narrowing to Int, so a bogus entry degrades to
@@ -1160,14 +1224,36 @@ class ScanActivity : ComponentActivity() {
                 return spill!!.readRange(off, sz) ?: ByteArray(0)
             }
             val st = stream!!
-            return if (off >= 0 && sz >= 0 && off + sz <= st.size.toLong() &&
+            val streamSize = st.size.toLong()
+            return if (off >= 0 && sz >= 0 && off <= streamSize && sz <= streamSize - off &&
                 off <= Int.MAX_VALUE && sz <= Int.MAX_VALUE
             ) st.copyOfRange(off.toInt(), (off + sz).toInt()) else ByteArray(0)
         }
 
-        // Persist one Manifest entry without ever materializing it as a whole
-        // ByteArray when the canonical spill is available. ContentStore.putFile
-        // hashes and atomically moves the staged file into the blob tree.
+        fun stageRangeToTemp(off: Long, sz: Long, name: String): java.io.File {
+            require(off >= 0 && sz >= 0 && off <= snapshot.totalRawSize &&
+                sz <= snapshot.totalRawSize - off) { "Manifest entry range out of bounds" }
+            val temp = java.io.File(stageDir, "${java.util.UUID.randomUUID()}.partial")
+            if (spillUsable) {
+                if (!spill!!.copyRangeToFile(off, sz, temp)) {
+                    throw java.io.IOException("无法从恢复缓存写出文件: $name")
+                }
+            } else {
+                val bytes = sliceAt(off, sz)
+                if (bytes.size.toLong() != sz) {
+                    throw java.io.IOException("恢复文件范围不完整: $name")
+                }
+                java.io.FileOutputStream(temp).use { output ->
+                    output.write(bytes)
+                    output.fd.sync()
+                }
+            }
+            return temp
+        }
+
+        // Persist one Manifest entry through a complete staged file. The spill
+        // path remains bounded-memory; the defensive in-memory fallback also
+        // gains a durable retry/forensic copy if index publication fails.
         fun putRange(
             off: Long,
             sz: Long,
@@ -1176,47 +1262,44 @@ class ScanActivity : ComponentActivity() {
             bundleId: String? = null,
             bundleTitle: String? = null,
         ): com.airferry.app.scan.ContentStore.PutResult {
-            if (!spillUsable) {
-                return store.putBytes(
-                    this, name, sliceAt(off, sz),
-                    crcUnknown = true, kind = kind,
-                    bundleId = bundleId, bundleTitle = bundleTitle,
-                )
-            }
-            require(off >= 0 && sz >= 0 && off <= snapshot.totalRawSize &&
-                sz <= snapshot.totalRawSize - off) { "Manifest entry range out of bounds" }
-            val temp = java.io.File(stageDir, "${java.util.UUID.randomUUID()}.partial")
-            if (!spill!!.copyRangeToFile(off, sz, temp)) {
-                throw java.io.IOException("无法从恢复缓存写出文件: $name")
-            }
+            val temp = stageRangeToTemp(off, sz, name)
+            // The source is complete and fsync'd. Persist ownership before
+            // ContentStore starts publishing so abrupt process death cannot
+            // make startup cleanup erase the pre-index copy.
+            val request = com.airferry.app.scan.ContentStore.PutFileRequest(
+                name, temp,
+                crcUnknown = true, kind = kind,
+                bundleId = bundleId, bundleTitle = bundleTitle,
+                expectedSize = sz,
+                stableEntryId = stableEntryId(0),
+            )
+            markRecoveryStagePreserved(listOf(request))
             return try {
-                store.putFile(
-                    this, name, temp,
-                    crcUnknown = true, kind = kind,
-                    bundleId = bundleId, bundleTitle = bundleTitle,
-                    expectedSize = sz,
+                val result = store.putFileBatch(this, listOf(request)).single()
+                releaseRecoveryStage()
+                result
+            } catch (e: Exception) {
+                // Copy-before-index publication leaves this complete source in
+                // place. Keep its durable marker for startup recovery/forensics.
+                throw RecoveryPublicationException(
+                    "接收历史提交失败；文件已保留在 ${temp.absolutePath}: ${e.message}",
+                    durableStage = true,
+                    cause = e,
                 )
-            } finally {
-                // putFile normally moves the source. Clean up only when a
-                // failed publication left a task-owned temporary behind.
-                if (temp.exists()) temp.delete()
             }
         }
 
         // ── Single UTF8_TEXT entry → text view (AF2 kind, no magic sniffing) ──
         if (nonDirEntries.size == 1 && nonDirEntries[0].kind == 2) {
             val e0 = nonDirEntries[0]
-            val textName = e0.path.ifEmpty { TEXT_RECEIVED_NAME }
+            val textName = e0.savePath.ifEmpty { e0.path.ifEmpty { TEXT_RECEIVED_NAME } }
             val textBytes = if (com.airferry.app.scan.TextLike.fitsTextUi(e0.size))
                 sliceAt(e0.offset, e0.size) else null
             val text = textBytes?.let { com.airferry.app.scan.TextLike.decodeUtf8Strict(it) }
 
             if (text != null) {
                 updateRecoveryStage("正在保存文字…")
-                val put = store.putBytes(
-                    this, textName, textBytes,
-                    crcUnknown = true, kind = "text",
-                )
+                val put = putRange(e0.offset, e0.size, textName, "text")
                 clearRecoveryStage()
                 return Intent(this, ReceiveTextActivity::class.java).apply {
                     putExtra("FILE_PATH", put.path.absolutePath)
@@ -1244,54 +1327,56 @@ class ScanActivity : ComponentActivity() {
             val totalFiles = nonDirEntries.size
             val ts = java.text.SimpleDateFormat("MMdd_HHmmss", java.util.Locale.getDefault())
                 .format(java.util.Date())
-            val bundleId = java.util.UUID.randomUUID().toString()
+            // Transfer-derived keys make the index commit idempotent. If the
+            // process dies after SaveIndex but before the resume ledger is
+            // deleted, the next recovery returns these entries instead of
+            // appending a duplicate bundle.
+            val bundleId = "af2-$recoveryKey"
             val bundleTitle = "发送_$ts"
             updateRecoveryStage("正在保存 $totalFiles 个文件…")
             // Stage-then-commit: every member is materialized first and the
             // whole bundle enters history with a single index write, so a
             // mid-bundle disk failure cannot leave a truncated bundle behind.
-            val puts = if (spillUsable) {
+            val puts = run {
                 val temps = ArrayList<java.io.File>(totalFiles)
+                var preserveCompletedStage = false
                 try {
                     for ((index, e) in nonDirEntries.withIndex()) {
                         updateRecoveryStage("正在写出 ${index + 1}/$totalFiles 个文件…")
-                        require(e.offset >= 0 && e.size >= 0 &&
-                            e.offset <= snapshot.totalRawSize &&
-                            e.size <= snapshot.totalRawSize - e.offset) { "Manifest entry range out of bounds" }
-                        val temp = java.io.File(stageDir, "${java.util.UUID.randomUUID()}.partial")
-                        if (!spill!!.copyRangeToFile(e.offset, e.size, temp)) {
-                            throw java.io.IOException("无法从恢复缓存写出文件: ${e.path}")
-                        }
-                        temps.add(temp)
+                        temps.add(stageRangeToTemp(e.offset, e.size, e.path))
                     }
                     updateRecoveryStage("正在保存 $totalFiles 个文件…")
-                    store.putFileBatch(
-                        this,
-                        nonDirEntries.mapIndexed { i, e ->
-                            com.airferry.app.scan.ContentStore.PutFileRequest(
-                                e.savePath.ifEmpty { e.path }, temps[i],
-                                crcUnknown = true, kind = "file",
-                                bundleId = bundleId, bundleTitle = bundleTitle,
-                                expectedSize = e.size,
-                            )
-                        },
-                    )
-                } finally {
-                    // Moved files are already gone; dedup hits and failure
-                    // temps end here.
-                    for (t in temps) if (t.exists()) t.delete()
-                }
-            } else {
-                store.putBytesBatch(
-                    this,
-                    nonDirEntries.map { e ->
-                        com.airferry.app.scan.ContentStore.PutBytesRequest(
-                            e.savePath.ifEmpty { e.path }, sliceAt(e.offset, e.size),
+                    val requests = nonDirEntries.mapIndexed { i, e ->
+                        com.airferry.app.scan.ContentStore.PutFileRequest(
+                            e.savePath.ifEmpty { e.path }, temps[i],
                             crcUnknown = true, kind = "file",
                             bundleId = bundleId, bundleTitle = bundleTitle,
+                            expectedSize = e.size,
+                            stableEntryId = stableEntryId(i),
                         )
-                    },
-                )
+                    }
+                    markRecoveryStagePreserved(requests)
+                    preserveCompletedStage = true
+                    val stored = try {
+                        store.putFileBatch(this, requests)
+                    } catch (e: Exception) {
+                        throw RecoveryPublicationException(
+                            "接收历史提交失败；完整文件已保留在 ${stageDir.absolutePath}: ${e.message}",
+                            durableStage = true,
+                            cause = e,
+                        )
+                    }
+                    releaseRecoveryStage()
+                    preserveCompletedStage = false
+                    stored
+                } finally {
+                    // Staging failures are partial and can be cleaned. Once
+                    // every member exists, keep rollback-restored files if the
+                    // one index commit fails.
+                    if (!preserveCompletedStage) {
+                        for (t in temps) if (t.exists()) t.delete()
+                    }
+                }
             }
 
             val paths = ArrayList<String>()
@@ -1304,14 +1389,16 @@ class ScanActivity : ComponentActivity() {
                 sizes.add(p.entry.size.toString())
                 entryIds.add(p.entry.id)
             }
+            val committedBundleId = puts.firstOrNull()?.entry?.bundleId ?: bundleId
+            val committedBundleTitle = puts.firstOrNull()?.entry?.bundleTitle ?: bundleTitle
             clearRecoveryStage()
             return Intent(this, ReceiveBundleActivity::class.java).apply {
                 putStringArrayListExtra("FILE_PATHS", paths)
                 putStringArrayListExtra("FILE_NAMES", names)
                 putStringArrayListExtra("FILE_SIZES", sizes)
                 putStringArrayListExtra("ENTRY_IDS", entryIds)
-                putExtra("BUNDLE_ID", bundleId)
-                putExtra("BUNDLE_TITLE", bundleTitle)
+                putExtra("BUNDLE_ID", committedBundleId)
+                putExtra("BUNDLE_TITLE", committedBundleTitle)
                 putExtra("TOTAL_FILES", totalFiles)
                 putExtra("RESAVE", true)
             }
@@ -1319,7 +1406,8 @@ class ScanActivity : ComponentActivity() {
 
         // ── Single file entry (or empty-entry defensive fallback) ──
         val entry = nonDirEntries.firstOrNull()
-        val fileName = entry?.path?.takeIf { it.isNotEmpty() }
+        val fileName = entry?.savePath?.takeIf { it.isNotEmpty() }
+            ?: entry?.path?.takeIf { it.isNotEmpty() }
             ?: displayName.ifEmpty { "received_file" }
         val fileOffset = entry?.offset ?: 0L
         val fileSize = entry?.size ?: snapshot.totalRawSize
@@ -1334,6 +1422,16 @@ class ScanActivity : ComponentActivity() {
             putExtra("ENTRY_ID", put.entry.id)
             putExtra("CRC32_UNKNOWN", true)
             putExtra("RESAVE", true)
+        }
+        } finally {
+            if (!preserveRecoveryStage) {
+                try {
+                    stageDir.deleteRecursively()
+                    if (stageRoot.listFiles()?.isEmpty() == true) stageRoot.delete()
+                } catch (e: Exception) {
+                    Log.w(TAG, "could not clean recovery stage $stageDir", e)
+                }
+            }
         }
     }
 
@@ -1472,6 +1570,13 @@ class ScanActivity : ComponentActivity() {
         val sessionRef = session
         val spillRef = chunkSpill
         chunkSpill = null
+        // Discard the journal with the spill, never one without the other:
+        // listPendingTransfers() reports a ledger whose .partial is gone as a
+        // resumable transfer (spillBytes just reads 0), so dropping only the
+        // spill leaves FileListActivity advertising a transfer that can never
+        // resume — and whose bytes this teardown already deleted.
+        val ledgerRef = ledger
+        ledger = null
         // Drain the IO executor BEFORE tearing down the decode pool: the pending
         // recovery task holds the pool's ingest lock and touches the native
         // session, so freeing the handle first would race it. Shutdown lets an
@@ -1498,10 +1603,12 @@ class ScanActivity : ComponentActivity() {
                 pool.runExclusive {
                     sessionRef.destroy()
                     spillRef?.discard()
+                    ledgerRef?.discard()
                 }
             } else {
                 sessionRef.destroy()
                 spillRef?.discard()
+                ledgerRef?.discard()
             }
         }.apply { isDaemon = true; name = "airferry-destroy" }.start()
     }

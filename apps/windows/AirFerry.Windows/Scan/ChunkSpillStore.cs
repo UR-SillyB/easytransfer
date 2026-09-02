@@ -25,6 +25,7 @@ namespace AirFerry.Windows.Scan;
 /// </summary>
 public sealed class ChunkSpillStore : IDisposable
 {
+    private const int MaxChunkCount = 131_072;
     private readonly string _path;
     private FileStream? _stream;
     /// <summary>
@@ -38,6 +39,14 @@ public sealed class ChunkSpillStore : IDisposable
     public ChunkSpillStore(string dir, string transferIdHex, bool deleteExisting = true)
     {
         Directory.CreateDirectory(dir);
+        // The id arrives straight from the native snapshot JSON and is written
+        // to BEFORE Af2LedgerStore.Create applies the same check, so
+        // containment must not rest on the core's hex encoding alone. Reject
+        // here, where no bytes have been written yet.
+        if (transferIdHex.Length > 0 && !Af2LedgerStore.IsSafeTransferId(transferIdHex))
+        {
+            throw new ArgumentException("Invalid AF2 transfer id", nameof(transferIdHex));
+        }
         string id = string.IsNullOrEmpty(transferIdHex) ? "session" : transferIdHex;
         _path = Path.Combine(dir, $"af2-{id}.partial");
         // A same-id orphan from an earlier attempt must not leak bytes into
@@ -52,10 +61,15 @@ public sealed class ChunkSpillStore : IDisposable
     /// <summary>pwrite one completed chunk at its canonical-stream offset.</summary>
     public void Write(int index, int chunkRawSize, byte[] bytes)
     {
-        if (index < 0 || chunkRawSize <= 0 || bytes.Length == 0)
+        if (index < 0 || index >= MaxChunkCount || chunkRawSize <= 0 || bytes.Length == 0 ||
+            bytes.Length > chunkRawSize)
         {
             throw new ArgumentOutOfRangeException(nameof(index), "invalid spill chunk");
         }
+        // A rewrite can partially damage a previously-good range before an
+        // I/O/Flush(true) failure is reported. Withdraw the durable bit first;
+        // only a fully flushed replacement may add it back.
+        _knownChunks.Remove(index);
         FileStream fs = _stream ??= new FileStream(
             _path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
         fs.Seek((long)index * chunkRawSize, SeekOrigin.Begin);
@@ -156,12 +170,14 @@ public sealed class ChunkSpillStore : IDisposable
         }
         string? dir = Path.GetDirectoryName(destinationPath);
         if (dir is not null) Directory.CreateDirectory(dir);
+        bool createdDestination = false;
         try
         {
             fs.Seek(offset, SeekOrigin.Begin);
             using var output = new FileStream(
                 destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                 bufferSize, FileOptions.SequentialScan | FileOptions.WriteThrough);
+            createdDestination = true;
             byte[] buffer = new byte[(int)Math.Min((long)bufferSize, Math.Max(1L, size))];
             long remaining = size;
             while (remaining > 0)
@@ -177,13 +193,22 @@ public sealed class ChunkSpillStore : IDisposable
         }
         catch
         {
-            try { File.Delete(destinationPath); } catch { }
+            if (createdDestination)
+            {
+                try { File.Delete(destinationPath); } catch { }
+            }
             return false;
         }
     }
 
     /// <summary>Does this chunk hold spilled bytes (written or resumed)?</summary>
     public bool HasChunk(int index) => _knownChunks.Contains(index);
+
+    /// <summary>
+    /// Stop trusting one sparse range while keeping its bytes available as a
+    /// hash-gated last resort. A re-supplied native chunk can overwrite it.
+    /// </summary>
+    public void Invalidate(int index) => _knownChunks.Remove(index);
 
     /// <summary>Register chunks a §12 resume knows are durable in the spill.</summary>
     public void MarkResumed(IEnumerable<int> indices)

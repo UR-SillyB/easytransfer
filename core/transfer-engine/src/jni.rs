@@ -272,7 +272,7 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverLast
     let session = unsafe { &*(handle as *const ReceiverSession) };
     session
         .last_completed_chunk_index()
-        .map(|i| i as jint)
+        .and_then(|i| jint::try_from(i).ok())
         .unwrap_or(-1)
 }
 

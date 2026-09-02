@@ -11,6 +11,17 @@ const TID_CAFE = "33333333333333333333333333333333"
 const TID_WRITE_FAIL = "44444444444444444444444444444444"
 const TID_REMOVE_FAIL = "55555555555555555555555555555555"
 const TID_BEEF = "66666666666666666666666666666666"
+const TID_KEEPALIVE = "77777777777777777777777777777777"
+const TID_OLD_RESUME = "88888888888888888888888888888888"
+const TID_MARKER_FAIL = "99999999999999999999999999999999"
+const TID_ORPHAN = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const TID_BAD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+const TID_FRESH = "cccccccccccccccccccccccccccccccc"
+const TID_OLDEST = "dddddddddddddddddddddddddddddddd"
+const TID_MIDDLE = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+const TID_NEWEST = "ffffffffffffffffffffffffffffffff"
+const TID_OLDER_SMALL = "01010101010101010101010101010101"
+const TID_NEWEST_LARGE = "02020202020202020202020202020202"
 const LEGAL_CHUNK_SIZE = 1024 * 1024
 
 class FakeFileHandle {
@@ -26,10 +37,13 @@ class FakeFileHandle {
     /** Simulates a stale/short getFile() snapshot (size guard must trip). */
     this.getFileSize = null
     this.getFileFailsWhileSyncOpen = false
+    this.failGetFile = false
     this.failWritableWrite = false
+    this.abortCount = 0
   }
 
   async getFile() {
+    if (this.failGetFile) throw new Error("simulated getFile failure")
     if (this.getFileFailsWhileSyncOpen && this.syncOpen) {
       throw new Error("getFile unavailable while sync handle is open")
     }
@@ -113,6 +127,9 @@ class FakeFileHandle {
         file.bytes = working
         file.lastModified++
       },
+      async abort() {
+        file.abortCount++
+      },
     }
   }
 }
@@ -121,12 +138,14 @@ class FakeDirectoryHandle {
   constructor() {
     this.files = new Map()
     this.failRemoveNames = new Set()
+    this.failCreateNames = new Set()
   }
 
   async getFileHandle(name, options = {}) {
     const existing = this.files.get(name)
     if (existing) return existing
     if (!options.create) throw new Error("not found")
+    if (this.failCreateNames.has(name)) throw new Error("simulated create failure")
     const file = new FakeFileHandle(name)
     this.files.set(name, file)
     return file
@@ -184,6 +203,32 @@ test("ChunkStore treats a short OPFS write as non-durable", async () => {
 
   assert.equal(store.writeChunk(0, 4, Uint8Array.from([9, 8, 7, 6])), "memory")
   assert.deepEqual(Array.from(store.readRange(0, 4, 4, 4)), [9, 8, 7, 6])
+})
+
+test("ChunkStore rejects an out-of-range index before growing the sparse backing", async () => {
+  const dir = new FakeDirectoryHandle()
+  const store = new ChunkStore()
+  await store.init(dir, "index-cap")
+  const partial = dir.files.get("af2-index-cap.partial")
+
+  assert.throws(
+    () => store.writeChunk(131_072, 4, Uint8Array.from([1, 2, 3, 4])),
+    /AF2_STORAGE_FATAL/
+  )
+  assert.equal(partial.bytes.byteLength, 0)
+})
+
+test("ChunkStore rejects a chunk outside the declared transfer geometry", async () => {
+  const dir = new FakeDirectoryHandle()
+  const store = new ChunkStore()
+  await store.init(dir, "geometry")
+  const partial = dir.files.get("af2-geometry.partial")
+
+  assert.throws(
+    () => store.writeChunk(1, 4, Uint8Array.from([1, 2, 3, 4]), 4),
+    /AF2_STORAGE_FATAL/
+  )
+  assert.equal(partial.bytes.byteLength, 0)
 })
 
 test("ChunkStore fails closed when memory fallback exceeds 64 MiB", async () => {
@@ -258,6 +303,19 @@ test("prepareBlobReads closes exclusive sync handle before lazy File slicing", a
   assert.deepEqual(Array.from(new Uint8Array(await blob.arrayBuffer())), [4, 3, 2, 1])
 })
 
+test("reopenAfterBlobReadFailure restores durable chunk reads for assemble retry", async () => {
+  const dir = new FakeDirectoryHandle()
+  const store = new ChunkStore()
+  await store.init(dir, "blob-retry")
+  store.writeChunk(0, 4, Uint8Array.from([5, 6, 7, 8]))
+
+  store.prepareBlobReads()
+  assert.equal(store.readChunk(0, 4, 4), null, "closed sync handle cannot serve verifier reads")
+
+  await store.reopenAfterBlobReadFailure()
+  assert.deepEqual(Array.from(store.readChunk(0, 4, 4) ?? []), [5, 6, 7, 8])
+})
+
 test("readRangeBlob refuses multi-chunk sync fallback instead of allocating O(entry)", async () => {
   const dir = new FakeDirectoryHandle()
   const store = new ChunkStore()
@@ -281,37 +339,71 @@ test("readRangeBlob refuses multi-chunk sync fallback instead of allocating O(en
 test("release + discard keep a delivered lazy Blob backing until orphan sweep grace expires", async () => {
   const dir = new FakeDirectoryHandle()
   const store = new ChunkStore()
-  await store.init(dir, "keepalive")
+  await store.init(dir, TID_KEEPALIVE)
   assert.equal(store.writeChunk(0, 4, Uint8Array.from([1, 2, 3, 4])), "disk")
 
   const blob = await store.readRangeBlob(0, 4, 4, 4)
-  store.release()
+  assert.equal(await store.release(), true)
+  assert.ok(dir.files.has(`af2-${TID_KEEPALIVE}.released`))
 
   // The delivered Blob is a lazy OPFS reference — the file must survive the
   // assemble step so the user's later download still reads valid bytes.
-  assert.ok(dir.files.has("af2-keepalive.partial"))
+  assert.ok(dir.files.has(`af2-${TID_KEEPALIVE}.partial`))
   assert.equal(blob.size, 4)
   assert.deepEqual(Array.from(new Uint8Array(await blob.arrayBuffer())), [1, 2, 3, 4])
 
   // Session reset must not unlink a backing file that a browser download may
   // still be consuming lazily.
   await store.discard()
-  assert.equal(dir.files.has("af2-keepalive.partial"), true)
+  assert.equal(dir.files.has(`af2-${TID_KEEPALIVE}.partial`), true)
   await sweepOrphanPartials(dir, 0)
-  assert.equal(dir.files.has("af2-keepalive.partial"), false)
+  assert.equal(dir.files.has(`af2-${TID_KEEPALIVE}.partial`), false)
+  assert.equal(dir.files.has(`af2-${TID_KEEPALIVE}.released`), false)
 })
 
 test("released backing grace starts at release, not an old chunk-write mtime", async () => {
   const dir = new FakeDirectoryHandle()
   const store = new ChunkStore()
-  await store.init(dir, "old-resume")
+  await store.init(dir, TID_OLD_RESUME)
   assert.equal(store.writeChunk(0, 4, Uint8Array.from([1, 2, 3, 4])), "disk")
-  dir.files.get("af2-old-resume.partial").lastModified = Date.now() - 24 * 60 * 60 * 1000
+  dir.files.get(`af2-${TID_OLD_RESUME}.partial`).lastModified = Date.now() - 24 * 60 * 60 * 1000
 
-  store.release()
+  assert.equal(await store.release(), true)
+  assert.ok(dir.files.has(`af2-${TID_OLD_RESUME}.released`))
   await store.discard()
   await sweepOrphanPartials(dir, 60_000)
-  assert.equal(dir.files.has("af2-old-resume.partial"), true)
+  assert.equal(dir.files.has(`af2-${TID_OLD_RESUME}.partial`), true)
+})
+
+test("an unreadable release marker fails closed instead of expiring an active Blob", async () => {
+  const dir = new FakeDirectoryHandle()
+  const store = new ChunkStore()
+  await store.init(dir, TID_OLD_RESUME)
+  store.writeChunk(0, 4, Uint8Array.from([1, 2, 3, 4]))
+  dir.files.get(`af2-${TID_OLD_RESUME}.partial`).lastModified =
+    Date.now() - 24 * 60 * 60 * 1000
+
+  assert.equal(await store.release(), true)
+  dir.files.get(`af2-${TID_OLD_RESUME}.released`).failGetFile = true
+  await store.discard()
+  await sweepOrphanPartials(dir, 60_000)
+
+  assert.equal(dir.files.has(`af2-${TID_OLD_RESUME}.partial`), true)
+  assert.equal(dir.files.has(`af2-${TID_OLD_RESUME}.released`), true)
+})
+
+test("release reports a missing durable marker without unlinking the Blob backing", async () => {
+  const dir = new FakeDirectoryHandle()
+  const store = new ChunkStore()
+  await store.init(dir, TID_MARKER_FAIL)
+  assert.equal(store.writeChunk(0, 4, Uint8Array.from([9, 8, 7, 6])), "disk")
+  dir.failCreateNames.add(`af2-${TID_MARKER_FAIL}.released`)
+
+  assert.equal(await store.release(), false)
+  await store.discard()
+
+  assert.equal(dir.files.has(`af2-${TID_MARKER_FAIL}.partial`), true)
+  assert.equal(dir.files.has(`af2-${TID_MARKER_FAIL}.released`), false)
 })
 
 test("sweepOrphanPartials removes ledger-less partials and keeps journaled ones", async () => {
@@ -324,47 +416,118 @@ test("sweepOrphanPartials removes ledger-less partials and keeps journaled ones"
   assert.equal(live.writeChunk(0, 4, Uint8Array.from([2, 2, 2, 2])), "disk")
   // An orphan partial: released after a delivered transfer (ledger discarded).
   const owned = new ChunkStore()
-  await owned.init(dir, "orphan")
+  await owned.init(dir, TID_ORPHAN)
   assert.equal(owned.writeChunk(0, 4, Uint8Array.from([1, 1, 1, 1])), "disk")
 
   await sweepOrphanPartials(dir, 0)
 
   assert.ok(dir.files.has(`af2-${TID_JOURNALED}.partial`))
   assert.ok(dir.files.has(`af2-${TID_JOURNALED}.ledger.jsonl`))
-  assert.equal(dir.files.has("af2-orphan.partial"), false)
+  assert.equal(dir.files.has(`af2-${TID_ORPHAN}.partial`), false)
 })
 
 test("sweepOrphanPartials removes partials whose matching ledger is corrupt", async () => {
   const dir = new FakeDirectoryHandle()
-  const badLedger = await dir.getFileHandle("af2-bad.ledger.jsonl", { create: true })
+  const badLedger = await dir.getFileHandle(`af2-${TID_BAD}.ledger.jsonl`, { create: true })
   const writer = await badLedger.createWritable()
   await writer.write("not-json\n")
   await writer.close()
-  const partial = await dir.getFileHandle("af2-bad.partial", { create: true })
+  const partial = await dir.getFileHandle(`af2-${TID_BAD}.partial`, { create: true })
   const sync = await partial.createSyncAccessHandle()
   sync.write(Uint8Array.from([1, 2, 3, 4]), { at: 0 })
   sync.close()
 
   await sweepOrphanPartials(dir, 0)
 
-  assert.equal(dir.files.has("af2-bad.ledger.jsonl"), false)
-  assert.equal(dir.files.has("af2-bad.partial"), false)
+  assert.equal(dir.files.has(`af2-${TID_BAD}.ledger.jsonl`), false)
+  assert.equal(dir.files.has(`af2-${TID_BAD}.partial`), false)
 })
 
 test("sweepOrphanPartials preserves a fresh delivered partial during the grace period", async () => {
   const dir = new FakeDirectoryHandle()
-  const orphan = await dir.getFileHandle("af2-fresh.partial", { create: true })
+  const orphan = await dir.getFileHandle(`af2-${TID_FRESH}.partial`, { create: true })
   const sync = await orphan.createSyncAccessHandle()
   sync.write(Uint8Array.from([7, 7, 7, 7]), { at: 0 })
   sync.close()
   orphan.lastModified = Date.now()
 
   await sweepOrphanPartials(dir, 60_000)
-  assert.equal(dir.files.has("af2-fresh.partial"), true)
+  assert.equal(dir.files.has(`af2-${TID_FRESH}.partial`), true)
 
   orphan.lastModified = Date.now() - 120_000
   await sweepOrphanPartials(dir, 60_000)
-  assert.equal(dir.files.has("af2-fresh.partial"), false)
+  assert.equal(dir.files.has(`af2-${TID_FRESH}.partial`), false)
+})
+
+test("sweepOrphanPartials bounds retained backings, evicting the oldest first", async () => {
+  const dir = new FakeDirectoryHandle()
+  const now = Date.now()
+  // Three in-grace delivered backings of 100 bytes each; cap allows only 250.
+  for (const [name, ageMs] of [
+    [`af2-${TID_OLDEST}.partial`, 3_000],
+    [`af2-${TID_MIDDLE}.partial`, 2_000],
+    [`af2-${TID_NEWEST}.partial`, 1_000],
+  ]) {
+    const handle = await dir.getFileHandle(name, { create: true })
+    const sync = await handle.createSyncAccessHandle()
+    sync.write(new Uint8Array(100), { at: 0 })
+    sync.close()
+    handle.lastModified = now - ageMs
+  }
+
+  // Without a cap the grace keeps all three.
+  await sweepOrphanPartials(dir, 60_000, 10_000)
+  assert.equal(dir.files.size, 3, "grace alone must retain every fresh backing")
+
+  // With a 250-byte cap, the oldest is dropped until the set fits.
+  await sweepOrphanPartials(dir, 60_000, 250)
+  assert.equal(dir.files.has(`af2-${TID_OLDEST}.partial`), false, "oldest is evicted first")
+  assert.equal(dir.files.has(`af2-${TID_MIDDLE}.partial`), true)
+  assert.equal(dir.files.has(`af2-${TID_NEWEST}.partial`), true, "newest keeps its grace")
+})
+
+test("sweepOrphanPartials keeps one oversize newest backing until grace expires", async () => {
+  const dir = new FakeDirectoryHandle()
+  const now = Date.now()
+  for (const [name, size, ageMs] of [
+    [`af2-${TID_OLDER_SMALL}.partial`, 100, 2_000],
+    [`af2-${TID_NEWEST_LARGE}.partial`, 300, 1_000],
+  ]) {
+    const handle = await dir.getFileHandle(name, { create: true })
+    const sync = await handle.createSyncAccessHandle()
+    sync.write(new Uint8Array(size), { at: 0 })
+    sync.close()
+    handle.lastModified = now - ageMs
+  }
+
+  await sweepOrphanPartials(dir, 60_000, 250)
+  assert.equal(dir.files.has(`af2-${TID_OLDER_SMALL}.partial`), false)
+  assert.equal(
+    dir.files.has(`af2-${TID_NEWEST_LARGE}.partial`),
+    true,
+    "a single legal download larger than the retained-set cap must keep its grace"
+  )
+})
+
+test("sweepOrphanPartials leaves files outside the canonical AF2 namespace untouched", async () => {
+  const dir = new FakeDirectoryHandle()
+  for (const name of [
+    "notes.ledger.jsonl",
+    "af2-short.ledger.jsonl",
+    "af2-short.partial",
+    "af2-short.released",
+  ]) {
+    await dir.getFileHandle(name, { create: true })
+  }
+
+  await sweepOrphanPartials(dir, 0)
+
+  assert.deepEqual(Array.from(dir.files.keys()).sort(), [
+    "af2-short.ledger.jsonl",
+    "af2-short.partial",
+    "af2-short.released",
+    "notes.ledger.jsonl",
+  ])
 })
 
 test("OpfsJournal loadMostRecent skips a corrupt newer journal", async () => {
@@ -374,11 +537,27 @@ test("OpfsJournal loadMostRecent skips a corrupt newer journal", async () => {
   await valid.commit(2)
   dir.files.get(`af2-${TID_OLDER}.ledger.jsonl`).lastModified = 100
 
-  const bad = await dir.getFileHandle("af2-newer.ledger.jsonl", { create: true })
+  const bad = await dir.getFileHandle(`af2-${TID_BAD}.ledger.jsonl`, { create: true })
   const w = await bad.createWritable()
   await w.write("bad")
   await w.close()
   bad.lastModified = 200
+
+  const loaded = await OpfsJournal.loadMostRecent(dir)
+  assert.equal(loaded.transferIdHex, TID_OLDER)
+  assert.deepEqual(loaded.completed, [2])
+})
+
+test("OpfsJournal loadMostRecent skips an inaccessible candidate", async () => {
+  const dir = new FakeDirectoryHandle()
+  const valid = new OpfsJournal()
+  await valid.init(dir, TID_OLDER, LEGAL_CHUNK_SIZE, "01020304")
+  await valid.commit(2)
+
+  const inaccessible = await dir.getFileHandle(
+    `af2-${TID_NEWEST}.ledger.jsonl`, { create: true }
+  )
+  inaccessible.failGetFile = true
 
   const loaded = await OpfsJournal.loadMostRecent(dir)
   assert.equal(loaded.transferIdHex, TID_OLDER)
@@ -470,6 +649,25 @@ test("OpfsJournal init is idempotent and keeps all committed chunk bits", async 
   assert.equal(loaded.transferIdHex, TID_CAFE)
   assert.deepEqual(loaded.completed, [0, 1])
   assert.deepEqual(Array.from(loaded.rootFrameBytes), [1, 2, 3, 4])
+})
+
+test("OpfsJournal aborts a failed header writer so initialization can retry", async () => {
+  const dir = new FakeDirectoryHandle()
+  const name = `af2-${TID_WRITE_FAIL}.ledger.jsonl`
+  const handle = await dir.getFileHandle(name, { create: true })
+  handle.failWritableWrite = true
+  const journal = new OpfsJournal()
+
+  await assert.rejects(
+    () => journal.init(dir, TID_WRITE_FAIL, LEGAL_CHUNK_SIZE, "01020304"),
+    /AF2_STORAGE_FATAL/
+  )
+  assert.equal(handle.abortCount, 1)
+
+  handle.failWritableWrite = false
+  await journal.init(dir, TID_WRITE_FAIL, LEGAL_CHUNK_SIZE, "01020304")
+  const loaded = await OpfsJournal.loadMostRecent(dir)
+  assert.equal(loaded.transferIdHex, TID_WRITE_FAIL)
 })
 
 test("OpfsJournal commit propagates failure without recording the bit", async () => {

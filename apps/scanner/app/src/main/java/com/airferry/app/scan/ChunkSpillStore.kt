@@ -21,7 +21,24 @@ import java.io.RandomAccessFile
  */
 class ChunkSpillStore(dir: File, transferIdHex: String) {
 
-    private val path = File(dir, "af2-${transferIdHex.ifEmpty { "session" }}.partial")
+    private companion object {
+        const val MAX_CHUNK_COUNT = 131_072
+    }
+
+    private val path: File
+
+    init {
+        // The id reaches this path straight from the native snapshot JSON and
+        // is written to BEFORE Af2LedgerStore.create applies the same check —
+        // so containment must not rest on the core's hex encoding alone.
+        // Reject here, where no bytes have been written yet.
+        require(transferIdHex.isEmpty() ||
+            transferIdHex.matches(Af2LedgerStore.SAFE_TRANSFER_ID)) {
+            "invalid AF2 transfer id"
+        }
+        path = File(dir, "af2-${transferIdHex.ifEmpty { "session" }}.partial")
+    }
+
     private var raf: RandomAccessFile? = null
     /** Sparse-file length cannot prove which ranges are real (holes read as
      * zeroes), so track chunks known durable this session / from §12 resume. */
@@ -29,9 +46,14 @@ class ChunkSpillStore(dir: File, transferIdHex: String) {
 
     /** pwrite one completed chunk at its canonical-stream offset + fsync. */
     fun write(index: Int, chunkRawSize: Int, bytes: ByteArray) {
-        require(index >= 0 && chunkRawSize > 0 && bytes.isNotEmpty()) {
+        require(index in 0 until MAX_CHUNK_COUNT && chunkRawSize > 0 && bytes.isNotEmpty() &&
+            bytes.size <= chunkRawSize) {
             "invalid spill chunk"
         }
+        // A rewrite can partially damage a previously-good range before an
+        // I/O/fsync failure is reported. Withdraw the durable bit up front and
+        // restore it only after the complete replacement reaches stable storage.
+        knownChunks.remove(index)
         val f = raf ?: RandomAccessFile(path, "rw").also { raf = it }
         f.seek(index.toLong() * chunkRawSize.toLong())
         f.write(bytes)
@@ -42,6 +64,12 @@ class ChunkSpillStore(dir: File, transferIdHex: String) {
     }
 
     fun hasChunk(index: Int): Boolean = index in knownChunks
+
+    /** Stop trusting one sparse range while leaving its bytes available as a
+     * hash-gated last resort. A re-supplied native chunk can then overwrite it. */
+    fun invalidate(index: Int) {
+        knownChunks.remove(index)
+    }
 
     fun markResumed(indices: IntArray) {
         for (index in indices) knownChunks.add(index)
@@ -66,7 +94,10 @@ class ChunkSpillStore(dir: File, transferIdHex: String) {
         } catch (_: Exception) {
             return null
         }
-        if (offset + size > f.length()) return null
+        val fileLength = f.length()
+        // Subtraction form is overflow-safe. `offset + size` could wrap and
+        // otherwise allow a hostile range to allocate before the read fails.
+        if (offset > fileLength || size > fileLength - offset) return null
         val out = ByteArray(size.toInt())
         f.seek(offset)
         var done = 0
@@ -101,7 +132,12 @@ class ChunkSpillStore(dir: File, transferIdHex: String) {
         }
         if (offset > f.length() || size > f.length() - offset) return false
         destination.parentFile?.mkdirs()
+        var createdDestination = false
         return try {
+            // Never truncate caller data. Callers normally use UUID temp
+            // names, but this primitive must still fail closed on collision.
+            if (!destination.createNewFile()) return false
+            createdDestination = true
             f.seek(offset)
             FileOutputStream(destination, false).use { out ->
                 val buffer = ByteArray(
@@ -120,7 +156,7 @@ class ChunkSpillStore(dir: File, transferIdHex: String) {
             destination.isFile && destination.length() == size
         } catch (e: Exception) {
             android.util.Log.w("ChunkSpillStore", "copyRangeToFile failed", e)
-            destination.delete()
+            if (createdDestination) destination.delete()
             false
         }
     }

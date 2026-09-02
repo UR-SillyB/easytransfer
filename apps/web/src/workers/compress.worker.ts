@@ -28,7 +28,12 @@
 
 /// <reference lib="webworker" />
 
-import { senderPathForFile, uniqueSenderPath, type SenderFileItem } from "@/lib/sender-path"
+import {
+  normalizeSenderPath,
+  senderPathForFile,
+  uniqueSenderPath,
+  type SenderFileItem,
+} from "@/lib/sender-path"
 import {
   consumeEncodedChunk,
   retainBytes,
@@ -286,7 +291,7 @@ async function runPrepare(
     if (typeof text === "string") {
       // NFC-normalize: the AF2 manifest validates paths as Unicode NFC and
       // rejects combining marks (macOS delivers NFD filenames by default).
-      const cleanName = (name || "文字消息.txt").trim().normalize("NFC")
+      const cleanName = normalizeSenderPath(name?.trim() || "文字消息.txt")
       displayName = cleanName
       const encoded = new TextEncoder().encode(text)
       if (encoded.byteLength > MAX_ORIGINAL_BYTES) {

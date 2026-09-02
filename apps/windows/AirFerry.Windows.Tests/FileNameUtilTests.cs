@@ -66,6 +66,83 @@ public class FileNameUtilTests
     }
 
     [Fact]
+    public void UniqueTarget_TreatsSameNamedDirectoriesAsCollisions()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "AirFerry.FileNameUtilTests",
+            Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "report.txt"));
+            Directory.CreateDirectory(Path.Combine(root, "report(1).txt"));
+
+            Assert.Equal(
+                Path.Combine(root, "report(2).txt"),
+                FileNameUtil.UniqueTarget(root, "report.txt"));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void UniqueRelativeTarget_RejectsSymlinkedParentDirectory()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // Creating a Windows symlink requires Developer Mode or an
+            // elevated test process. The production check uses the same
+            // ReparsePoint attribute for symlinks and junctions.
+            return;
+        }
+        string sandbox = Path.Combine(Path.GetTempPath(), "AirFerry.FileNameUtilTests",
+            Guid.NewGuid().ToString("N"));
+        string root = Path.Combine(sandbox, "root");
+        string outside = Path.Combine(sandbox, "outside");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(outside);
+        string link = Path.Combine(root, "escape");
+        Directory.CreateSymbolicLink(link, outside);
+        try
+        {
+            Assert.Throws<IOException>(() =>
+                FileNameUtil.UniqueRelativeTarget(root, "escape/stolen.txt"));
+            Assert.False(File.Exists(Path.Combine(outside, "stolen.txt")));
+        }
+        finally
+        {
+            Directory.Delete(link);
+            Directory.Delete(sandbox, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void UniqueTarget_TreatsDanglingSymlinkAsOccupied()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+        string root = Path.Combine(Path.GetTempPath(), "AirFerry.FileNameUtilTests",
+            Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        string link = Path.Combine(root, "report.txt");
+        File.CreateSymbolicLink(link, Path.Combine(root, "missing-target"));
+        try
+        {
+            Assert.Equal(
+                Path.Combine(root, "report(1).txt"),
+                FileNameUtil.UniqueTarget(root, "report.txt"));
+        }
+        finally
+        {
+            File.Delete(link);
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public void Sanitize_DropsLeadingDots()
     {
         Assert.Equal("hidden", FileNameUtil.Sanitize(".hidden"));

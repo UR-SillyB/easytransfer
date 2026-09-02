@@ -93,6 +93,8 @@ class QrDecodePool(
     private var lowerFullCountStreak: Int = 0
     /** Consecutive tracked-region misses in multi mode → trigger re-lock. */
     private val multiMiss = AtomicLong(0)
+    /** Consecutive partial tracked hits → repair a moved/starved slot sooner. */
+    private val partialMiss = AtomicLong(0)
     /** Periodic full scans discover codes omitted by an initially partial lock. */
     private val multiFrames = AtomicLong(0)
 
@@ -303,7 +305,9 @@ class QrDecodePool(
         // frame — exactly what this tracker exists to avoid.
         val dueFullLock = tracked == null || lockedCount == 0 ||
             frameOrdinal % MULTI_PERIODIC_FULL_EVERY == 0L ||
-            (multiMiss.get() > 0 && multiMiss.get() % MULTI_FULL_DECODE_EVERY == 0L)
+            (multiMiss.get() > 0 && multiMiss.get() % MULTI_FULL_DECODE_EVERY == 0L) ||
+            (partialMiss.get() > 0 &&
+                partialMiss.get() % PARTIAL_FULL_DECODE_EVERY == 0L)
         if (!dueFullLock && tracked != null && lockedCount > 0) {
             val buf = try {
                 ZxingDecoder.decodeMultiYTracked(
@@ -321,6 +325,11 @@ class QrDecodePool(
                 // for codes that missed this frame (so they're hinted again next
                 // frame instead of being permanently dropped).
                 updateTrackedSlots(results)
+                if (results.size < lockedCount) {
+                    partialMiss.incrementAndGet()
+                } else {
+                    partialMiss.set(0)
+                }
                 multiMiss.set(0)
                 return results
             }
@@ -344,6 +353,7 @@ class QrDecodePool(
         } else {
             multiMiss.incrementAndGet()
         }
+        partialMiss.set(0)
         return results
     }
 
@@ -646,6 +656,8 @@ class QrDecodePool(
         private const val MULTI_FULL_DECODE_EVERY = 3L
         /** Full discovery scan even while some tracked regions keep succeeding. */
         private const val MULTI_PERIODIC_FULL_EVERY = 30L
+        /** Repair one moved/missed lane without waiting for the periodic scan. */
+        private const val PARTIAL_FULL_DECODE_EVERY = 5L
         private const val MAX_TRACKED_CODES = 4
         /** Require several lower-count full discoveries before retiring stale slots. */
         private const val TRACK_SHRINK_AFTER_FULL_SCANS = 3

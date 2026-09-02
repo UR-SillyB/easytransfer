@@ -24,6 +24,11 @@ import {
 interface Props {
   isOpen: boolean
   onClose: () => void
+  /** Read at click time (not render time) so a just-locked transfer cannot be
+   * deleted during the React state update that announces its metadata. */
+  getProtectedTransferIds?: () => readonly string[]
+  /** Presentation hint; the click-time callback remains the authority. */
+  protectedTransferId?: string
 }
 
 function formatBytes(bytes: number): string {
@@ -40,7 +45,12 @@ function formatDate(ts: number): string {
   return `${d.getMonth() + 1}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-export function HistoryModal({ isOpen, onClose }: Props) {
+export function HistoryModal({
+  isOpen,
+  onClose,
+  getProtectedTransferIds = () => [],
+  protectedTransferId = "",
+}: Props) {
   const [items, setItems] = useState<ReceiveHistoryItem[]>([])
   const [copiedId, setCopiedId] = useState<string | null>(null)
 
@@ -57,13 +67,28 @@ export function HistoryModal({ isOpen, onClose }: Props) {
   if (!isOpen) return null
 
   const handleDelete = async (id: string) => {
-    await deleteHistoryItem(id)
+    const protectedIds = getProtectedTransferIds()
+    if (protectedIds.includes(id)) {
+      alert("该传输仍在接收、恢复或结果下载中，请完成或重置后再清理。")
+      return
+    }
+    const removed = await deleteHistoryItem(id, protectedIds)
+    if (!removed) {
+      alert("断点文件仍被占用或暂时无法删除，记录已保留，请稍后重试。")
+    }
     reload()
   }
 
   const handleClearAll = async () => {
-    if (window.confirm("确定要清空全部接收历史并清除所有未完成的断点缓存吗？")) {
-      await clearAllReceiveHistory()
+    const protectedIds = getProtectedTransferIds()
+    const protectedHint = protectedIds.length > 0
+      ? "\n当前正在使用的传输将被保留。"
+      : ""
+    if (window.confirm(`确定要清空全部接收历史并清除所有未完成的断点缓存吗？${protectedHint}`)) {
+      const result = await clearAllReceiveHistory(protectedIds)
+      if (result.failed > 0) {
+        alert(`${result.failed} 条断点仍被占用或无法删除，已保留以便稍后重试。`)
+      }
       reload()
     }
   }
@@ -108,6 +133,7 @@ export function HistoryModal({ isOpen, onClose }: Props) {
             <div className="history-list">
               {items.map((it) => {
                 const isPartial = it.status === "partial"
+                const isProtected = it.id === protectedTransferId
                 const pct =
                   it.totalChunks > 0
                     ? Math.min(100, Math.round((it.completedChunks / it.totalChunks) * 100))
@@ -139,7 +165,8 @@ export function HistoryModal({ isOpen, onClose }: Props) {
                       <button
                         className="btn-text delete-btn"
                         onClick={() => handleDelete(it.id)}
-                        title="删除记录"
+                        title={isProtected ? "当前传输正在使用，暂不可删除" : "删除记录"}
+                        disabled={isProtected}
                       >
                         <DeleteIcon size={14} />
                       </button>
@@ -165,8 +192,15 @@ export function HistoryModal({ isOpen, onClose }: Props) {
                             className="btn btn-xs"
                             onClick={() => handleCopyText(it.id, it.textContent || "")}
                           >
-                            {copiedId === it.id ? "已复制" : "复制"}
+                            {copiedId === it.id
+                              ? "已复制"
+                              : it.textContentTruncated
+                                ? "复制已保留片段"
+                                : "复制"}
                           </button>
+                          {it.textContentTruncated && (
+                            <span className="hint-text">历史仅保留前 16 KiB</span>
+                          )}
                         </div>
                       )
                     )}

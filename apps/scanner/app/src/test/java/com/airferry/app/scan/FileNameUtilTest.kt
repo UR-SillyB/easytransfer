@@ -15,23 +15,22 @@ class FileNameUtilTest {
 
     @Test
     fun truncationNeverSplitsSurrogatePairs() {
-        // 201 'A' + one emoji (surrogate pair): the cut at 200 chars would
-        // otherwise leave an orphan high surrogate at the end — assert the
-        // result is well-formed (no dangling surrogates) and 200 chars.
-        val name = "A".repeat(201) + "😀"
+        // 199 'A' + one emoji (surrogate pair): the cut at 200 chars lands
+        // between the pair. Match Windows by retaining the filename prefix
+        // and backing up one code unit so the pair is dropped whole.
+        val name = "A".repeat(199) + "😀" + "tail"
         val sanitized = FileNameUtil.sanitize(name)
-        assertEquals(200, sanitized.length)
+        assertEquals("A".repeat(199), sanitized)
         assertFalse(Character.isHighSurrogate(sanitized.last()))
     }
 
     @Test
-    fun truncationDropsOrphanLowSurrogateAtCut() {
-        // 199 'A' + emoji(2 chars) + 'Z': takeLast(200) would start at the
-        // emoji's low surrogate; the sanitizer must skip it instead.
-        val name = "A".repeat(199) + "😀" + "Z"
+    fun truncationKeepsStablePrefixInsteadOfAttackerControlledTail() {
+        val name = "prefix-" + "A".repeat(193) + "attacker-tail"
         val sanitized = FileNameUtil.sanitize(name)
-        assertFalse(Character.isLowSurrogate(sanitized.first()))
-        assertTrue(sanitized.endsWith("Z"))
+        assertEquals("prefix-" + "A".repeat(193), sanitized)
+        assertTrue(sanitized.startsWith("prefix-"))
+        assertFalse(sanitized.endsWith("attacker-tail"))
     }
 
     @Test

@@ -87,10 +87,13 @@ impl Decoder {
     pub fn add_symbol_with_novelty(&mut self, symbol: &Symbol) -> Result<(bool, bool)> {
         let sbn = symbol.id.sbn as usize;
         if sbn >= self.blocks.len() {
-            return Err(crate::Error::BlockOutOfRange {
-                sbn: symbol.id.sbn,
-                total: self.blocks.len() as u32,
-            });
+            // Same class as the out-of-range ESI / wrong-symbol-size drops
+            // below: a hostile or corrupt coordinate, not an unusable decoder.
+            // Returning Err here cost the caller its whole chunk decoder (the
+            // AF2 receiver drops the slot on Err), so one crafted frame
+            // carrying a valid object_id and a bogus SBN could destroy an
+            // in-progress chunk repeatedly and stall the transfer for good.
+            return Ok((self.is_complete(), false));
         }
         // Defensive: drop hostile symbol coordinates that would panic raptorq.
         // `PayloadId::new` asserts ESI < 2^24, and sub-block unpacking slices
@@ -265,5 +268,29 @@ mod tests {
         let data = random_data(35_000);
         let got = encode_decode(&data, 20, true, true).expect("should recover at 20% drop");
         assert_eq!(got, data);
+    }
+
+    #[test]
+    fn out_of_range_sbn_is_dropped_without_killing_the_decoder() {
+        // The AF2 receiver drops its whole chunk-decoder slot when this call
+        // returns Err, so a hostile SBN must be ignored like any other
+        // malformed coordinate — otherwise one crafted frame stalls the chunk
+        // permanently. Accumulated symbols must survive it.
+        let data = random_data(4_096);
+        let enc = Encoder::new(&data, Config::default()).unwrap();
+        let good = enc.source_symbols(0).unwrap().remove(0);
+        let mut dec = Decoder::new(enc.meta().clone()).unwrap();
+        let (_complete, novel) = dec.add_symbol_with_novelty(&good).unwrap();
+        assert!(novel);
+
+        let blocks = dec.blocks.len() as u32;
+        let hostile = Symbol::new(blocks + 7, 0, vec![0; dec.meta.symbol_size as usize]);
+        let (_complete, novel) = dec
+            .add_symbol_with_novelty(&hostile)
+            .expect("an out-of-range SBN must not be a decoder-fatal error");
+        assert!(!novel, "a dropped symbol must not inflate progress");
+
+        // The previously accepted symbol is still there.
+        assert!(dec.blocks[0].seen_esi.contains(&good.id.esi));
     }
 }

@@ -77,10 +77,75 @@ class ChunkSpillStoreTest {
     }
 
     @Test
+    fun invalidationWithdrawsTrustUntilReplacementIsDurable() {
+        val store = ChunkSpillStore(tmp.root, "tid-repair")
+        store.write(0, 4, byteArrayOf(1, 2, 3, 4))
+        assertTrue(store.hasChunk(0))
+
+        store.invalidate(0)
+        assertFalse(store.hasChunk(0))
+        // Bytes remain readable only as the caller's hash-gated last resort.
+        assertArrayEquals(byteArrayOf(1, 2, 3, 4), store.readRange(0, 4))
+
+        store.write(0, 4, byteArrayOf(5, 6, 7, 8))
+        assertTrue(store.hasChunk(0))
+        assertArrayEquals(byteArrayOf(5, 6, 7, 8), store.readRange(0, 4))
+    }
+
+    @Test
     fun discardRemovesSpill() {
         val store = ChunkSpillStore(tmp.root, "tid5")
         store.write(0, 8192, ByteArray(8192) { 1 })
         store.discard()
         assertFalse(spillPath("tid5").exists())
+    }
+
+    @Test
+    fun copyRangeRefusesToOverwriteExistingDestination() {
+        val store = ChunkSpillStore(tmp.root, "tid-existing-output")
+        store.write(0, 4, byteArrayOf(1, 2, 3, 4))
+        val destination = File(tmp.root, "valuable.bin")
+        destination.writeBytes(byteArrayOf(9, 9, 9))
+
+        assertFalse(store.copyRangeToFile(0, 4, destination))
+        assertArrayEquals(byteArrayOf(9, 9, 9), destination.readBytes())
+    }
+
+    @Test
+    fun readRangeRejectsOverflowingEndOffset() {
+        val store = ChunkSpillStore(tmp.root, "tid-overflow")
+        store.write(0, 4, byteArrayOf(1, 2, 3, 4))
+        assertNull(store.readRange(Long.MAX_VALUE, 2))
+    }
+
+    @Test
+    fun rejectsATransferIdThatCouldEscapeTheSpillDirectory() {
+        // The id is written to before Af2LedgerStore.create validates it, so
+        // the spill store must reject a traversing id itself.
+        for (hostile in listOf("../../evil", "a/b", "a\\b", "tid x", "tid\u0000x", "x".repeat(65))) {
+            try {
+                ChunkSpillStore(tmp.root, hostile)
+                throw AssertionError("expected rejection of transfer id: $hostile")
+            } catch (_: IllegalArgumentException) {
+                // expected
+            }
+        }
+        // The documented empty-id fallback and ordinary hex ids still work.
+        ChunkSpillStore(tmp.root, "")
+        ChunkSpillStore(tmp.root, "a1b2c3")
+    }
+
+    @Test
+    fun rejectsChunkIndexOutsideProtocolBudgetBeforeCreatingSparseFile() {
+        val store = ChunkSpillStore(tmp.root, "tid-index-cap")
+
+        try {
+            store.write(131_072, 32 * 1024 * 1024, byteArrayOf(1))
+            throw AssertionError("expected out-of-protocol index rejection")
+        } catch (_: IllegalArgumentException) {
+            // expected
+        }
+
+        assertFalse(spillPath("tid-index-cap").exists())
     }
 }

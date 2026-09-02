@@ -4,6 +4,10 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.UUID
 import org.json.JSONObject
 
 /**
@@ -11,7 +15,8 @@ import org.json.JSONObject
  * `.partial` file.
  *
  * Format: one JSONL journal per transfer, `af2-<tid>.ledger.jsonl`.
- * - Line 1 (header): `{"v":1,"tid":…,"root":…,"crs":…}` — written once,
+ * - Line 1 (header): `{"v":1,"tid":…,"rid":…,"root":…,"crs":…}` — `rid`
+ *   identifies this receive attempt (legacy headers omit it); written once,
  *   atomically (temp file + fsync + rename) before the first chunk commit.
  * - Each later line: `{"c":<index>}` (chunk committed after spill+fsync) or
  *   `{"i":<index>}` (chunk invalidated after a re-verification failure).
@@ -29,6 +34,10 @@ class Af2LedgerStore private constructor(private val path: File) {
 
     var transferIdHex: String = ""
         private set
+    /** One receive attempt, persisted across process restart. Unlike Transfer
+     * ID this changes when the same content is intentionally received again. */
+    var recoveryId: String = ""
+        private set
     var chunkRawSize: Int = 0
         private set
     /** ROOT frame bytes (hex at rest) for the §12 resume() call. */
@@ -43,6 +52,7 @@ class Af2LedgerStore private constructor(private val path: File) {
     fun reload(): Boolean {
         completed.clear()
         transferIdHex = ""
+        recoveryId = ""
         chunkRawSize = 0
         rootFrameBytes = ByteArray(0)
         headerDurable = false
@@ -79,6 +89,8 @@ class Af2LedgerStore private constructor(private val path: File) {
         }
         val fileTid = transferIdFromLedgerName(path.name) ?: return false
         val parsedTid = header.optString("tid", "")
+        val hasRecoveryId = header.has("rid")
+        val parsedRecoveryId = if (hasRecoveryId) header.optString("rid", "") else parsedTid
         val parsedVersion = strictInt(header, "v")
         val parsedChunkRawSize = strictInt(header, "crs") ?: 0
         val rootHex = header.optString("root", "")
@@ -88,11 +100,13 @@ class Af2LedgerStore private constructor(private val path: File) {
             ByteArray(0)
         }
         if (
-            header.length() != 4 ||
+            header.length() != (if (hasRecoveryId) 5 else 4) ||
             header.opt("tid") !is String ||
             header.opt("root") !is String ||
+            (hasRecoveryId && header.opt("rid") !is String) ||
             parsedVersion != 1 ||
             parsedTid != fileTid ||
+            !parsedRecoveryId.matches(SAFE_RECOVERY_ID) ||
             parsedChunkRawSize !in LEGAL_CHUNK_RAW_SIZES ||
             parsedRoot.isEmpty()
         ) return false
@@ -130,6 +144,7 @@ class Af2LedgerStore private constructor(private val path: File) {
             }
         }
         transferIdHex = parsedTid
+        recoveryId = parsedRecoveryId
         chunkRawSize = parsedChunkRawSize
         rootFrameBytes = parsedRoot
         completed.addAll(parsedCompleted)
@@ -185,7 +200,8 @@ class Af2LedgerStore private constructor(private val path: File) {
         private val LEGAL_CHUNK_RAW_SIZES = setOf(1, 2, 4, 8, 16, 32).mapTo(mutableSetOf()) {
             it * 1024 * 1024
         }
-        private val SAFE_TRANSFER_ID = Regex("^[A-Za-z0-9_-]{1,64}$")
+        internal val SAFE_TRANSFER_ID = Regex("^[A-Za-z0-9_-]{1,64}$")
+        private val SAFE_RECOVERY_ID = Regex("^[A-Za-z0-9_-]{1,64}$")
 
         private fun transferIdFromLedgerName(name: String): String? {
             val prefix = "af2-"
@@ -196,7 +212,7 @@ class Af2LedgerStore private constructor(private val path: File) {
 
         /** List all uncompleted/partial transfer ledgers in `dir`. */
         fun listPendingTransfers(dir: File): List<PendingTransfer> {
-            val candidates = dir.listFiles { f -> f.name.startsWith("af2-") && f.name.endsWith(".ledger.jsonl") }
+            val candidates = dir.listFiles { f -> transferIdFromLedgerName(f.name) != null }
                 ?: return emptyList()
             val list = mutableListOf<PendingTransfer>()
             for (f in candidates) {
@@ -232,7 +248,7 @@ class Af2LedgerStore private constructor(private val path: File) {
 
         /** Resume source: newest valid ledger in `dir` (by mtime), or null. */
         fun loadMostRecent(dir: File): Af2LedgerStore? {
-            val candidates = dir.listFiles { f -> f.name.endsWith(".ledger.jsonl") }
+            val candidates = dir.listFiles { f -> transferIdFromLedgerName(f.name) != null }
                 ?: return null
             for (candidate in candidates.sortedByDescending { it.lastModified() }) {
                 try {
@@ -248,7 +264,7 @@ class Af2LedgerStore private constructor(private val path: File) {
         /** Remove unrecoverable spill files that have no valid resume journal. */
         fun sweepOrphanPartials(dir: File) {
             val validTids = mutableSetOf<String>()
-            dir.listFiles { f -> f.name.endsWith(".ledger.jsonl") }?.forEach { file ->
+            dir.listFiles { f -> transferIdFromLedgerName(f.name) != null }?.forEach { file ->
                 val store = Af2LedgerStore(file)
                 if (store.reload()) {
                     validTids.add(store.transferIdHex)
@@ -275,39 +291,53 @@ class Af2LedgerStore private constructor(private val path: File) {
             require(rootFrameBytes.size in 1..MAX_ROOT_FRAME_BYTES) {
                 "invalid AF2 ROOT frame"
             }
+            if ((!dir.exists() && !dir.mkdirs()) || !dir.isDirectory) {
+                throw IOException("AF2 ledger directory is unavailable")
+            }
             val path = File(dir, "af2-$transferIdHex.ledger.jsonl")
-            path.delete() // a relock restarts the journal from scratch
+            val recoveryId = UUID.randomUUID().toString()
             val header = JSONObject()
                 .put("v", 1)
                 .put("tid", transferIdHex)
+                .put("rid", recoveryId)
                 .put("crs", chunkRawSize)
                 .put("root", bytesToHex(rootFrameBytes))
             // Atomic header: temp + fsync + rename so a crash mid-create
             // never leaves a headerless journal that a later commit would
-            // append to.
-            val tmp = File(dir, path.name + ".tmp")
+            // append to. Keep an existing same-transfer ledger intact until
+            // the replacement header itself is durable: a disk-full failure
+            // during relock must not destroy otherwise resumable work.
+            val tmp = File(dir, "${path.name}.${UUID.randomUUID()}.tmp")
             try {
                 FileOutputStream(tmp).use { fos ->
                     fos.write((header.toString() + "\n").toByteArray())
                     fos.fd.sync()
                 }
-                if (!tmp.renameTo(path)) {
-                    // Cross-filesystem rename fallback (cache dirs are same-FS
-                    // in practice; copy keeps the fsync-before-rename order).
-                    tmp.copyTo(path, overwrite = true)
-                    // copyTo closes its stream but does not promise a physical
-                    // flush.  Re-open and fsync before declaring the header
-                    // durable.
-                    FileOutputStream(path, true).use { it.fd.sync() }
-                    path.setLastModified(System.currentTimeMillis())
-                    tmp.delete()
+                try {
+                    Files.move(
+                        tmp.toPath(),
+                        path.toPath(),
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                } catch (_: AtomicMoveNotSupportedException) {
+                    // Both paths live in the same cache directory. Even when
+                    // the provider lacks ATOMIC_MOVE, a replace-rename occurs
+                    // only after the new header has been flushed.
+                    Files.move(
+                        tmp.toPath(),
+                        path.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
                 }
             } catch (e: Exception) {
-                tmp.delete()
                 throw IOException("AF2 ledger header write failed", e)
+            } finally {
+                tmp.delete()
             }
             return Af2LedgerStore(path).apply {
                 this.transferIdHex = transferIdHex
+                this.recoveryId = recoveryId
                 this.chunkRawSize = chunkRawSize
                 this.rootFrameBytes = rootFrameBytes.copyOf()
                 this.headerDurable = true

@@ -50,7 +50,29 @@ test("uniqueSenderPath only renames a true full-path collision", () => {
   assert.equal(uniqueSenderPath(used, "Root/A/foo.txt"), "Root/A/foo (1).txt")
 })
 
+test("uniqueSenderPath keeps a suffixed max-length component wire-legal", () => {
+  const name = `${"a".repeat(251)}.txt`
+  const used = new Set([name])
+  const duplicate = uniqueSenderPath(used, name)
+  assert.equal(duplicate, `${"a".repeat(247)} (1).txt`)
+  assert.ok(new TextEncoder().encode(duplicate).byteLength <= 255)
+})
+
 test("normalizeSenderPath canonicalizes separators and rejects traversal", () => {
   assert.equal(normalizeSenderPath("Root\\A\\e\u0301.txt"), "Root/A/é.txt")
   assert.throws(() => normalizeSenderPath("Root/../secret.txt"), /包含 \.\./)
+  assert.throws(() => normalizeSenderPath("Root/bad\nname.txt"), /控制字符/)
+  assert.throws(() => normalizeSenderPath(`${"界".repeat(86)}.txt`), /单段超过 255 字节/)
+})
+
+test("uniqueSenderPath fails early when a 1024-byte path has no suffix room", () => {
+  const path = [
+    "a".repeat(255),
+    "b".repeat(255),
+    "c".repeat(255),
+    "d".repeat(254),
+    "x",
+  ].join("/")
+  assert.equal(new TextEncoder().encode(path).byteLength, 1024)
+  assert.throws(() => uniqueSenderPath(new Set([path]), path), /无法为重名文件添加唯一后缀/)
 })

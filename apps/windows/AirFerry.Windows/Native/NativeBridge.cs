@@ -176,15 +176,16 @@ internal static class NativeBridge
     /// are recoverable in bounded RAM. Returns 1 only when the decompressed
     /// size, CRC32 (when <paramref name="crcKnown"/>) and SHA-256
     /// (<paramref name="expectedShaHex"/>, lowercase hex) all match; on any
-    /// failure the partial output file is removed.
+    /// failure the partial output file is removed. The output path must not
+    /// already exist; the native side refuses to overwrite caller data.
     /// </summary>
     /// <remarks>
     /// <para><b>UTF-8 path encoding:</b> the three path/hex string params are
     /// passed as NUL-terminated UTF-8 <see cref="byte"/>[] (built with
     /// <c>Encoding.UTF8.GetBytes(s + "\0")</c>), NOT <c>[MarshalAs(LPStr)]
     /// string</c>. The Rust side (<c>cffi.rs::cstr</c>) reads them via
-    /// <c>CStr::from_ptr().to_bytes()</c> + <c>from_utf8_lossy</c>, i.e. it
-    /// assumes UTF-8. <c>LPStr</c> marshals as ANSI (system codepage = GBK on
+    /// <c>CStr::from_ptr().to_bytes()</c> + strict UTF-8 validation.
+    /// <c>LPStr</c> marshals as ANSI (system codepage = GBK on
     /// zh-CN), which corrupts any non-ASCII path — and the store root is
     /// <c>&lt;MyDocuments&gt;\AirFerry\store\...</c>, which on a localized
     /// Windows is under <c>文档</c> or a non-ASCII username. Using UTF-8

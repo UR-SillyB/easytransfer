@@ -425,10 +425,21 @@ impl SenderSessionWasm {
         bytes: Vec<u8>,
         raw_hash: &[u8],
     ) -> Result<(), JsValue> {
+        let digest = match raw_hash.len() {
+            0 => None,
+            32 => {
+                let mut digest = [0u8; 32];
+                digest.copy_from_slice(raw_hash);
+                Some(digest)
+            }
+            len => {
+                return Err(JsValue::from_str(&format!(
+                    "AF2 stage_chunk failed: raw_hash must be empty or 32 bytes, got {len}"
+                )));
+            }
+        };
         let inner = &mut self.inner;
-        let result = if raw_hash.len() == 32 {
-            let mut digest = [0u8; 32];
-            digest.copy_from_slice(raw_hash);
+        let result = if let Some(digest) = digest {
             inner.stage_chunk_with_raw_hash(index, codec_id, bytes, digest)
         } else {
             inner.stage_chunk(index, codec_id, bytes)
@@ -491,9 +502,14 @@ impl ReceiverSessionWasm {
         self.inner.is_complete()
     }
 
-    /// Index of the chunk completed by the most recent ChunkReady frame (or 0).
-    pub fn last_chunk_index(&self) -> u32 {
-        self.inner.last_completed_chunk_index().unwrap_or(0)
+    /// Index of the chunk completed by the most recent ChunkReady frame, or
+    /// -1 when none. Keep the sentinel identical to JNI and the C ABI: using
+    /// 0 for "none" can silently misattribute a failed invariant to chunk 0.
+    pub fn last_chunk_index(&self) -> i32 {
+        self.inner
+            .last_completed_chunk_index()
+            .and_then(|index| i32::try_from(index).ok())
+            .unwrap_or(-1)
     }
 
     /// Bytes of a completed chunk currently in memory (or empty if evicted).
@@ -562,6 +578,12 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    let max_hex_len = af2::manifest::MAX_MANIFEST_BYTES
+        .checked_mul(2)
+        .ok_or_else(|| "manifest hex length limit overflow".to_string())?;
+    if s.len() > max_hex_len {
+        return Err(format!("manifest hex exceeds {} characters", max_hex_len));
+    }
     if s.len() % 2 != 0 {
         return Err("odd hex length".into());
     }

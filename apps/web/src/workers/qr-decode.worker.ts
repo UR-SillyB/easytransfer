@@ -366,6 +366,7 @@ function resetTracker(): void {
   lockedCount = 0
   multiMiss = 0
   multiFrames = 0
+  partialMiss = 0
   lowerFullCountStreak = 0
 }
 

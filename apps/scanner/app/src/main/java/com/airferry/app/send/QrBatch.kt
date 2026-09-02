@@ -29,6 +29,7 @@ fun parseQrBatch(buf: ByteArray): QrBatch {
     var pos = 4
     val tiles = ArrayList<QrTile>(count)
     repeat(count) {
+        require(pos <= buf.size - 4) { "truncated tile header" }
         val side = leInt(buf, pos)
         pos += 4
         require(side in 21..177 && side % 4 == 1) { "bad QR side $side" }

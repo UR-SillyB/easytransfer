@@ -22,6 +22,8 @@ const MAX_LEDGER_BYTES = 32 * 1024 * 1024
 const MAX_ROOT_FRAME_HEX_CHARS = (26 + 2400 + 4) * 2
 const MAX_CHUNK_INDEX = 131_072 - 1
 const LEDGER_NAME_RE = /^af2-([0-9a-f]{32})\.ledger\.jsonl$/
+const PARTIAL_NAME_RE = /^af2-([0-9a-f]{32})\.partial$/
+const RELEASE_MARKER_NAME_RE = /^af2-([0-9a-f]{32})\.released$/
 const LEGAL_CHUNK_RAW_SIZES = new Set([1, 2, 4, 8, 16, 32].map((mib) => mib * 1024 * 1024))
 /**
  * In-process delivery timestamps for OPFS files backing lazy Blobs.  File
@@ -30,6 +32,7 @@ const LEGAL_CHUNK_RAW_SIZES = new Set([1, 2, 4, 8, 16, 32].map((mib) => mib * 10
  * period must start when ownership is released to the UI instead.
  */
 const releasedBackingAt = new Map<string, number>()
+const RELEASE_MARKER_SUFFIX = ".released"
 
 export class ChunkStore {
   private memory = new Map<number, Uint8Array>()
@@ -83,7 +86,11 @@ export class ChunkStore {
     if (!dir || !transferIdHex) return
     try {
       const fileName = `af2-${transferIdHex}.partial`
-      if (create) releasedBackingAt.delete(fileName)
+      releasedBackingAt.delete(fileName)
+      // A (re)activated transfer owns this backing again. Remove a prior
+      // delivery marker so a later orphan sweep cannot mistake live receive
+      // storage for a grace-period download.
+      try { await dir.removeEntry(`af2-${transferIdHex}${RELEASE_MARKER_SUFFIX}`) } catch {}
       this.opfsFile = create
         ? await dir.getFileHandle(fileName, { create: true })
         : await dir.getFileHandle(fileName)
@@ -98,10 +105,39 @@ export class ChunkStore {
     }
   }
 
-  writeChunk(index: number, chunkRawSize: number, bytes: Uint8Array): ChunkStorage {
+  writeChunk(
+    index: number,
+    chunkRawSize: number,
+    bytes: Uint8Array,
+    totalRawSize?: number,
+  ): ChunkStorage {
+    if (
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      index > MAX_CHUNK_INDEX ||
+      !Number.isSafeInteger(chunkRawSize) ||
+      chunkRawSize <= 0 ||
+      bytes.byteLength <= 0 ||
+      bytes.byteLength > chunkRawSize
+    ) {
+      throw new Error("AF2_STORAGE_FATAL: 分块索引或大小无效")
+    }
+    const at = index * chunkRawSize
+    if (!Number.isSafeInteger(at)) {
+      throw new Error("AF2_STORAGE_FATAL: 分块写入偏移超出安全范围")
+    }
+    if (totalRawSize !== undefined) {
+      if (
+        !Number.isSafeInteger(totalRawSize) ||
+        totalRawSize <= 0 ||
+        at >= totalRawSize ||
+        bytes.byteLength !== Math.min(chunkRawSize, totalRawSize - at)
+      ) {
+        throw new Error("AF2_STORAGE_FATAL: 分块与传输几何不一致")
+      }
+    }
     if (this.syncHandle && chunkRawSize > 0) {
       try {
-        const at = index * chunkRawSize
         const written = this.syncHandle.write(bytes, { at })
         if (written !== bytes.byteLength) {
           throw new Error(`short OPFS write: ${written}/${bytes.byteLength}`)
@@ -134,8 +170,19 @@ export class ChunkStore {
   }
 
   readRange(offset: number, size: number, totalRawSize: number, chunkRawSize: number): Uint8Array | null {
-    if (size <= 0 || offset < 0) return new Uint8Array(0)
-    if (chunkRawSize <= 0 || offset + size > totalRawSize) return null
+    if (
+      !Number.isSafeInteger(offset) ||
+      !Number.isSafeInteger(size) ||
+      !Number.isSafeInteger(totalRawSize) ||
+      !Number.isSafeInteger(chunkRawSize) ||
+      offset < 0 ||
+      size < 0 ||
+      totalRawSize < 0 ||
+      chunkRawSize <= 0 ||
+      offset > totalRawSize ||
+      size > totalRawSize - offset
+    ) return null
+    if (size === 0) return new Uint8Array(0)
 
     // Read chunk-by-chunk so a transfer can safely contain old OPFS-backed
     // chunks plus newer memory-fallback chunks after a transient write error.
@@ -193,7 +240,18 @@ export class ChunkStore {
     chunkRawSize: number,
     type = "application/octet-stream"
   ): Promise<Blob | null> {
-    if (size < 0 || offset < 0 || chunkRawSize <= 0 || offset + size > totalRawSize) return null
+    if (
+      !Number.isSafeInteger(offset) ||
+      !Number.isSafeInteger(size) ||
+      !Number.isSafeInteger(totalRawSize) ||
+      !Number.isSafeInteger(chunkRawSize) ||
+      size < 0 ||
+      offset < 0 ||
+      totalRawSize < 0 ||
+      chunkRawSize <= 0 ||
+      offset > totalRawSize ||
+      size > totalRawSize - offset
+    ) return null
     if (size === 0) return new Blob([], { type })
 
     // SyncAccessHandle has no lazy Blob view. Building a large Blob by pushing
@@ -279,6 +337,23 @@ export class ChunkStore {
     this.closeSyncHandle()
   }
 
+  /**
+   * Re-open the existing exclusive handle after result materialization failed.
+   * `prepareBlobReads()` intentionally closes it so File.slice() can back lazy
+   * Blobs, but a transient getFile()/entry failure must not make the next
+   * assemble attempt treat every still-durable chunk as missing.
+   */
+  async reopenAfterBlobReadFailure(): Promise<void> {
+    if (this.syncHandle || !this.opfsFile || this.preserveReleasedBacking) return
+    try {
+      if (typeof (this.opfsFile as any).createSyncAccessHandle === "function") {
+        this.syncHandle = await (this.opfsFile as any).createSyncAccessHandle()
+      }
+    } catch {
+      this.syncHandle = null
+    }
+  }
+
   markResumed(indices: number[]): void {
     for (const i of indices) {
       this.completedIndices.add(i)
@@ -303,7 +378,7 @@ export class ChunkStore {
    * backing in OPFS; [sweepOrphanPartials] reclaims it after a grace period so
    * an in-flight browser download is not invalidated by a quick rescan.
    */
-  release(): void {
+  async release(): Promise<boolean> {
     this.memory.clear()
     this.memoryBytes = 0
     this.diskIndices.clear()
@@ -312,7 +387,26 @@ export class ChunkStore {
     this.preserveReleasedBacking = this.opfsFile !== null
     if (this.preserveReleasedBacking && this.transferId) {
       releasedBackingAt.set(`af2-${this.transferId}.partial`, Date.now())
+      // Persist the delivery moment separately from the partial. Rewriting the
+      // partial merely to refresh mtime would invalidate File snapshots that
+      // already back UI Blobs; a zero-byte sidecar survives Worker recreation
+      // without touching those bytes.
+      if (this.opfsDir) {
+        let writer: any = null
+        try {
+          const marker = await this.opfsDir.getFileHandle(
+            `af2-${this.transferId}${RELEASE_MARKER_SUFFIX}`,
+            { create: true }
+          )
+          writer = await (marker as any).createWritable({ keepExistingData: false })
+          await writer.close()
+        } catch {
+          try { await writer?.abort?.() } catch {}
+          return false
+        }
+      }
     }
+    return true
   }
 
   async discard(): Promise<void> {
@@ -325,6 +419,9 @@ export class ChunkStore {
     if (!preserveBacking && this.opfsDir && this.transferId) {
       try {
         await this.opfsDir.removeEntry(`af2-${this.transferId}.partial`)
+      } catch {}
+      try {
+        await this.opfsDir.removeEntry(`af2-${this.transferId}${RELEASE_MARKER_SUFFIX}`)
       } catch {}
     }
     this.opfsFile = null
@@ -365,14 +462,17 @@ export class OpfsJournal {
     this.transferId = transferIdHex
     this.journalFile = null
     if (!dir || !transferIdHex || !rootHex) return
+    let w: any = null
     try {
       const fileName = `af2-${transferIdHex}.ledger.jsonl`
       this.journalFile = await dir.getFileHandle(fileName, { create: true })
       const header = JSON.stringify({ v: 1, tid: transferIdHex, crs, root: rootHex }) + "\n"
-      const w = await (this.journalFile as any).createWritable({ keepExistingData: false })
+      w = await (this.journalFile as any).createWritable({ keepExistingData: false })
       await w.write(header)
       await w.close()
+      w = null
     } catch (err) {
+      try { await w?.abort?.() } catch {}
       this.journalFile = null
       throw new Error(`AF2_STORAGE_FATAL: 断点日志初始化失败: ${String(err)}`)
     }
@@ -432,10 +532,15 @@ export class OpfsJournal {
     }
     let w: any = null
     try {
-      w = await (this.journalFile as any).createWritable({ keepExistingData: true })
       const size = (await this.journalFile.getFile()).size
+      const line = JSON.stringify(record) + "\n"
+      const lineBytes = new TextEncoder().encode(line).byteLength
+      if (size < 0 || size > MAX_LEDGER_BYTES - lineBytes) {
+        throw new Error("断点日志超过安全上限")
+      }
+      w = await (this.journalFile as any).createWritable({ keepExistingData: true })
       await w.seek(size)
-      await w.write(JSON.stringify(record) + "\n")
+      await w.write(line)
       await w.close()
     } catch (err) {
       try { await w?.abort?.() } catch {}
@@ -453,9 +558,13 @@ export class OpfsJournal {
     try {
       const candidates: Array<{ handle: FileSystemFileHandle; name: string; mtime: number }> = []
       for await (const [name, handle] of (dir as any).entries()) {
-        if (typeof name === "string" && name.endsWith(".ledger.jsonl") && handle.kind === "file") {
-          const file = await handle.getFile()
-          candidates.push({ handle, name, mtime: file.lastModified })
+        if (typeof name === "string" && LEDGER_NAME_RE.test(name) && handle.kind === "file") {
+          // One transiently inaccessible/corrupt candidate must not hide every
+          // other resumable transfer in the origin.
+          try {
+            const file = await handle.getFile()
+            candidates.push({ handle, name, mtime: file.lastModified })
+          } catch {}
         }
       }
       candidates.sort((a, b) => b.mtime - a.mtime)
@@ -594,27 +703,51 @@ export function hexToBytes(hex: string): Uint8Array {
 export async function sweepOrphanPartials(
   dir: FileSystemDirectoryHandle | null,
   orphanGraceMs = 60 * 60 * 1000,
+  retainedBytesCap = 2 * 1024 * 1024 * 1024,
 ): Promise<void> {
   if (!dir) return
   try {
     const ledgers = new Set<string>()
     const invalidLedgers: string[] = []
     const invalidLedgerTids = new Set<string>()
-    const partials: Array<{ name: string; mtime: number; releasedAt?: number }> = []
+    const releaseMarkers = new Map<string, { name: string; mtime: number | null }>()
+    const partials: Array<{
+      name: string
+      mtime: number
+      size: number
+      releasedAt?: number
+    }> = []
     for await (const [name, handle] of (dir as any).entries()) {
       if (typeof name !== "string" || handle.kind !== "file") continue
-      if (name.endsWith(".ledger.jsonl")) {
+      const ledgerMatch = LEDGER_NAME_RE.exec(name)
+      const markerMatch = RELEASE_MARKER_NAME_RE.exec(name)
+      const partialMatch = PARTIAL_NAME_RE.exec(name)
+      if (ledgerMatch) {
         if (await OpfsJournal.isValidLedger(handle)) {
           ledgers.add(name)
         } else {
           invalidLedgers.push(name)
-          invalidLedgerTids.add(name.replace(/^af2-/, "").replace(/\.ledger\.jsonl$/, ""))
+          invalidLedgerTids.add(ledgerMatch[1])
         }
       }
-      else if (name.startsWith("af2-") && name.endsWith(".partial")) {
+      else if (markerMatch) {
+        let mtime: number | null = null
+        try {
+          const value = (await handle.getFile()).lastModified
+          if (Number.isFinite(value) && value > 0) mtime = value
+        } catch {}
+        const partialName = `af2-${markerMatch[1]}.partial`
+        releaseMarkers.set(partialName, { name, mtime })
+      }
+      else if (partialMatch) {
         let mtime = 0
-        try { mtime = (await handle.getFile()).lastModified || 0 } catch {}
-        partials.push({ name, mtime, releasedAt: releasedBackingAt.get(name) })
+        let size = 0
+        try {
+          const file = await handle.getFile()
+          mtime = file.lastModified || 0
+          size = file.size || 0
+        } catch {}
+        partials.push({ name, mtime, size, releasedAt: releasedBackingAt.get(name) })
       }
     }
     // Mutate the directory only after enumeration completes; browser OPFS
@@ -623,19 +756,65 @@ export async function sweepOrphanPartials(
       try { await dir.removeEntry(invalid) } catch {}
     }
     const now = Date.now()
-    for (const { name: partial, mtime, releasedAt } of partials) {
+    const partialNames = new Set(partials.map(({ name }) => name))
+    const retained: Array<{ name: string; size: number; graceStartedAt: number }> = []
+    for (const { name: partial, mtime, size, releasedAt } of partials) {
       if (ledgers.has(partial.replace(/\.partial$/, ".ledger.jsonl"))) continue
-      const tid = partial.replace(/^af2-/, "").replace(/\.partial$/, "")
+      const tid = PARTIAL_NAME_RE.exec(partial)?.[1] ?? ""
       // A corrupt journal can never resume, so its backing spill is garbage
       // immediately. A ledger-less partial may instead back a just-delivered
       // lazy Blob; give browser downloads time to finish before unlinking it.
-      const graceStartedAt = releasedAt ?? mtime
+      // Prefer the durable sidecar timestamp: the module-level timestamp is
+      // lost whenever ReceivePage replaces its Worker, and the partial mtime
+      // may be hours old for a resumed transfer that needed no final write.
+      const marker = releaseMarkers.get(partial)
+      // Marker existence proves this is a delivered backing. If its metadata
+      // is transiently unreadable, fail closed and start a fresh grace window;
+      // falling back to an hours-old chunk mtime could unlink an active Blob.
+      const graceStartedAt = marker
+        ? (marker.mtime ?? now)
+        : (releasedAt ?? mtime)
       if (!invalidLedgerTids.has(tid) && orphanGraceMs > 0 && now - graceStartedAt < orphanGraceMs) {
+        retained.push({ name: partial, size, graceStartedAt })
         continue
       }
       try {
         await dir.removeEntry(partial)
         releasedBackingAt.delete(partial)
+        partialNames.delete(partial)
+      } catch {}
+    }
+    // The grace period is per-file, so back-to-back multi-gigabyte receives
+    // would hold every delivered backing for the full hour and can exhaust the
+    // OPFS quota — failing the next transfer. Bound the retained set, evicting
+    // oldest first so the most recent download keeps its grace.
+    let retainedBytes = retained.reduce((sum, entry) => sum + entry.size, 0)
+    if (retainedBytes > retainedBytesCap) {
+      retained.sort((a, b) => a.graceStartedAt - b.graceStartedAt)
+      // Never evict the newest backing solely because that one legal receive
+      // is larger than the cap (the web host allows up to 8 GiB while the
+      // default retained-set cap is 2 GiB). It may be feeding the download we
+      // just handed to the user. Reclaim every older grace entry first and
+      // tolerate one oversize newest entry until its normal grace expires.
+      for (let i = 0; i + 1 < retained.length; i++) {
+        if (retainedBytes <= retainedBytesCap) break
+        const entry = retained[i]
+        try {
+          await dir.removeEntry(entry.name)
+          releasedBackingAt.delete(entry.name)
+          partialNames.delete(entry.name)
+          retainedBytes -= entry.size
+        } catch {}
+      }
+    }
+    // Markers are meaningful only while their matching lazy-Blob backing
+    // exists. Remove sidecars after (and only after) the partial disappeared;
+    // if unlinking a live/locked partial failed, its protection must remain.
+    for (const [partialName, marker] of releaseMarkers) {
+      if (partialNames.has(partialName)) continue
+      try {
+        await dir.removeEntry(marker.name)
+        releasedBackingAt.delete(partialName)
       } catch {}
     }
   } catch {}

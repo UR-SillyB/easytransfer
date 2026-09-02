@@ -90,6 +90,7 @@ release/
 .workbuddy/
 .zcode/
 .codebuddy/
+.video_agent/
 
 # Local HTTPS self-signed certs (contain private keys; used by serve-https.mjs
 # for LAN receiver testing — never commit)

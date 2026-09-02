@@ -130,8 +130,8 @@ fn lzma2_dict_at_most(cap: u64) -> u32 {
 /// Parse a zstd frame header far enough to check its declared window size
 /// against `ZSTD_WINDOW_LOG_MAX`-equivalent bounds (23). Returns false on
 /// malformed headers (fail-closed) or oversized windows. `single_segment`
-/// frames derive the window from the pledged content size, which the output
-/// cap already bounds.
+/// frames derive the window from the pledged content size, so their FCS is
+/// checked directly against the same 2^23 bound.
 #[cfg(any(target_arch = "wasm32", test))]
 fn zstd_window_log_ok(data: &[u8]) -> bool {
     if data.len() < 6 || data[..4] != [0x28, 0xB5, 0x2F, 0xFD] {
@@ -172,7 +172,21 @@ fn zstd_window_log_ok(data: &[u8]) -> bool {
     // to prove that the complete declared frame header is present.
     debug_assert!(header_end <= data.len());
     if single_segment {
-        return true;
+        // A single-segment frame sets Window_Size = Frame_Content_Size, so
+        // bounding the FCS is exactly the native `window_log_max(23)` clamp.
+        // Returning true unconditionally here let the web receiver accept
+        // frames the native receivers reject — a cross-end divergence in the
+        // one preflight that is supposed to make them agree.
+        let fcs_start = header_end - fcs_size;
+        let mut fcs: u64 = 0;
+        for (i, b) in data[fcs_start..header_end].iter().enumerate() {
+            fcs |= u64::from(*b) << (8 * i);
+        }
+        // Zstandard adds an offset of 256 when the FCS field is 2 bytes.
+        if fcs_size == 2 {
+            fcs += 256;
+        }
+        return fcs <= 1u64 << ZSTD_WINDOW_LOG_MAX;
     }
     let wd = match window_descriptor {
         Some(b) => b,
@@ -297,10 +311,14 @@ pub fn compress(data: &[u8], level: i32) -> Result<Vec<u8>> {
 /// Decompress zstd-encoded `data`. (Kept for backward compatibility.)
 ///
 /// Single-frame + no-trailing + window clamp are enforced via
-/// [`zstd_decode_bounded`].
+/// [`zstd_decode_bounded`]. Output is capped at the absolute receiver ceiling
+/// [`MAX_ORIGINAL_BYTES`]: this entry point carries no per-chunk size, so an
+/// uncapped call would be a decompression-bomb hole in an otherwise
+/// fail-closed stack. Callers that know the expected size should prefer
+/// [`decompress_with_limit`] or [`decompress_chunk`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
-    zstd_decode_bounded(data, usize::MAX)
+    zstd_decode_bounded(data, legacy_output_ceiling())
 }
 
 /// Compress `data` with the algorithm identified by a [`COMPRESSION_*`] tag.
@@ -319,14 +337,33 @@ pub fn compress_with(data: &[u8], compression: u8) -> Result<Vec<u8>> {
 /// Decompress `data` using the algorithm identified by a [`COMPRESSION_*`] tag.
 ///
 /// `COMPRESSION_NONE` (and any unrecognized tag) returns the bytes unchanged,
-/// which keeps a descriptor/algorithm mismatch non-fatal.
+/// which keeps a descriptor/algorithm mismatch non-fatal. Output is capped at
+/// [`MAX_ORIGINAL_BYTES`] — see [`decompress`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn decompress_with(data: &[u8], compression: u8) -> Result<Vec<u8>> {
     match compression {
         COMPRESSION_ZSTD => decompress(data),
-        COMPRESSION_XZ => xz_decode_bounded(data, usize::MAX, MAX_XZ_DICT_BYTES),
-        _ => Ok(data.to_vec()),
+        COMPRESSION_XZ => {
+            xz_decode_bounded(data, legacy_output_ceiling(), MAX_XZ_DICT_BYTES)
+        }
+        _ => copy_capped(data, legacy_output_ceiling()),
     }
+}
+
+/// Absolute output ceiling for the size-less legacy decompress helpers.
+///
+/// Mirrors the clamp the C ABI applies to a host-supplied `max_output`, so no
+/// entry point into this crate can decode without a bomb bound.
+#[cfg(not(target_arch = "wasm32"))]
+fn legacy_output_ceiling() -> usize {
+    usize::try_from(raptorq_core::MAX_ORIGINAL_BYTES).unwrap_or(usize::MAX)
+}
+
+fn copy_capped(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
+    if data.len() > max_output {
+        return Err(Error::Compress("payload exceeds size limit".into()));
+    }
+    Ok(data.to_vec())
 }
 
 /// Like [`decompress_with`] but bounds the **output** size to `max_output` bytes.
@@ -349,10 +386,7 @@ pub fn decompress_with_limit(data: &[u8], compression: u8, max_output: usize) ->
                     "unknown compression algorithm tag {compression}"
                 )));
             }
-            if data.len() > max_output {
-                return Err(Error::Compress("payload exceeds size limit".into()));
-            }
-            Ok(data.to_vec())
+            copy_capped(data, max_output)
         }
     }
 }
@@ -418,8 +452,10 @@ pub struct DecompressStreamOutcome {
 ///
 /// `max_output` is a hard cap on the decompressed size (defends against a
 /// decompression bomb): the stream is rejected as soon as it would exceed it.
-/// On any failure (I/O, cap breach, decoder error) the partial output file is
-/// removed so a later retry never reads a truncated file as success.
+/// `output_path` must not already exist: verification failures may remove the
+/// partial output, so refusing replacement keeps unrelated caller data safe.
+/// On any later failure (I/O, cap breach, decoder error), a partial output
+/// created by this call is removed so retries never see it as success.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn decompress_stream_to_file(
     input_path: &str,
@@ -432,11 +468,9 @@ pub fn decompress_stream_to_file(
 
     let in_file =
         std::fs::File::open(input_path).map_err(|e| Error::Compress(format!("open input: {e}")))?;
-    // `File::create` truncates an existing destination. Reject the input
-    // itself (including symlink aliases and, on Unix, hard links) before that
-    // destructive step; otherwise a caller typo can erase the compressed
-    // source and the failure cleanup below then removes its final directory
-    // entry as well.
+    // Diagnose the particularly dangerous input/output alias case explicitly
+    // (including symlink aliases and, on Unix, hard links). All other existing
+    // outputs are rejected by `create_new` below without modifying them.
     if let Ok(_out_existing) = std::fs::File::open(output_path) {
         let same_canonical = std::fs::canonicalize(input_path)
             .ok()
@@ -466,7 +500,10 @@ pub fn decompress_stream_to_file(
         .map_err(|e| Error::Compress(format!("input metadata: {e}")))?
         .len();
     let mut reader = std::io::BufReader::with_capacity(128 * 1024, in_file);
-    let out_file = std::fs::File::create(output_path)
+    let out_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_path)
         .map_err(|e| Error::Compress(format!("create output: {e}")))?;
     let mut writer = BufWriter::with_capacity(1 << 20, out_file);
 
@@ -581,14 +618,18 @@ pub fn decompress_stream_to_file(
             "decompressed output exceeds expected size".into(),
         ));
     }
-    // Flush is the last fallible step. The documented contract is "any failure
-    // removes the partial output" — flush must not be a `?` that bypasses the
-    // remove (a failed flush can leave a partial/truncated file on disk). Handle
-    // it inline and remove on failure, mirroring the decode/over-limit branches.
+    // Flush + fsync are the last fallible steps. The caller treats success as
+    // a durable recovery artifact, not merely bytes accepted by the kernel
+    // page cache. Neither failure may bypass partial-output cleanup.
     if let Err(e) = writer.flush() {
         drop(writer);
         let _ = std::fs::remove_file(output_path);
         return Err(Error::Compress(format!("flush: {e}")));
+    }
+    if let Err(e) = writer.get_ref().sync_all() {
+        drop(writer);
+        let _ = std::fs::remove_file(output_path);
+        return Err(Error::Compress(format!("fsync: {e}")));
     }
     let digest = sha.finalize();
     Ok(DecompressStreamOutcome {
@@ -701,10 +742,7 @@ pub fn decompress_with_limit(data: &[u8], compression: u8, max_output: usize) ->
                     "unknown compression algorithm tag {compression}"
                 )));
             }
-            if data.len() > max_output {
-                return Err(Error::Compress("payload exceeds size limit".into()));
-            }
-            Ok(data.to_vec())
+            copy_capped(data, max_output)
         }
     }
 }
@@ -903,6 +941,15 @@ mod tests {
     }
 
     #[test]
+    fn raw_limited_decompress_rejects_input_past_the_cap() {
+        assert!(decompress_with_limit(&[1, 2, 3, 4], COMPRESSION_NONE, 3).is_err());
+        assert_eq!(
+            decompress_with_limit(&[1, 2, 3, 4], COMPRESSION_NONE, 4).unwrap(),
+            [1, 2, 3, 4]
+        );
+    }
+
+    #[test]
     fn decompress_with_limit_rejects_bomb() {
         // Highly compressible input expands far beyond a tiny cap.
         let data = vec![0u8; 1_000_000];
@@ -1009,6 +1056,35 @@ mod tests {
             "rejection must preserve the compressed source"
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn decompress_stream_to_file_preserves_an_existing_output() {
+        let dir = std::env::temp_dir();
+        let input = dir.join(format!(
+            "airferry_existing_stream_input_{}.bin",
+            std::process::id()
+        ));
+        let output = dir.join(format!(
+            "airferry_existing_stream_output_{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&input, b"new bytes").unwrap();
+        std::fs::write(&output, b"valuable existing output").unwrap();
+        let result = decompress_stream_to_file(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            COMPRESSION_NONE,
+            9,
+        );
+        assert!(result.is_err(), "an existing output must be rejected");
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            b"valuable existing output",
+            "rejection must not truncate or delete caller data"
+        );
+        std::fs::remove_file(input).unwrap();
+        std::fs::remove_file(output).unwrap();
     }
 
     /// The clamp must not break legitimate streams: every level/size this
@@ -1139,6 +1215,40 @@ mod tests {
             zstd::decode_all(&hostile_with_optional_field[..]).unwrap(),
             b"ABCD"
         );
+
+        // Single-segment frames set Window_Size = Frame_Content_Size, so the
+        // FCS must be bounded by the same 2^23 clamp. These were accepted
+        // unconditionally before, letting the web receiver take frames the
+        // native receiver rejects.
+        //
+        // FHD 0xE0: single-segment (0x20) + FCS field code 3 (8 bytes).
+        let single_segment_with_fcs = |fcs: u64| {
+            let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0xE0];
+            frame.extend_from_slice(&fcs.to_le_bytes());
+            frame.extend_from_slice(&[0x21, 0x00, 0x00, b'A', b'B', b'C', b'D']);
+            frame
+        };
+        assert!(
+            zstd_window_log_ok(&single_segment_with_fcs(1 << 23)),
+            "a single-segment frame at exactly the clamp must pass"
+        );
+        assert!(
+            !zstd_window_log_ok(&single_segment_with_fcs((1 << 23) + 1)),
+            "a single-segment frame past the clamp must be rejected"
+        );
+        assert!(
+            !zstd_window_log_ok(&single_segment_with_fcs(3 * 1024 * 1024 * 1024)),
+            "a 3 GiB single-segment window must be rejected"
+        );
+
+        // A real single-segment frame from the encoder still round-trips.
+        let small = b"single segment payload";
+        let mut single = zstd::bulk::compress(small, DEFAULT_LEVEL).unwrap();
+        // zstd may or may not pick single-segment; only assert when it did.
+        if single.len() > 5 && single[4] & 0x20 != 0 {
+            assert!(zstd_window_log_ok(&single));
+        }
+        single.clear();
     }
 
     /// Verify that the pure-Rust wasm32 compression codecs (zrip and lzma-rust2)

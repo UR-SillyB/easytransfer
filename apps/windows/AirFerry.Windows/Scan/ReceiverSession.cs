@@ -39,8 +39,10 @@ public sealed class ReceiverSession : IDisposable
         {
             var snap = GetSnapshot();
             if (!snap.MetaConfirmed || snap.SymbolSize == 0) return 0;
+            ulong symbols = snap.TotalRawSize / snap.SymbolSize;
+            if (snap.TotalRawSize % snap.SymbolSize != 0) symbols++;
             return (int)Math.Min(int.MaxValue,
-                (snap.TotalRawSize + snap.SymbolSize - 1) / snap.SymbolSize);
+                symbols);
         }
     }
 
@@ -323,11 +325,11 @@ public sealed class ReceiverSession : IDisposable
                     TransferIdHex = root.TryGetProperty("transfer_id_hex", out var tid) ? tid.GetString() ?? "" : "",
                     ContentIdHex = root.TryGetProperty("content_id_hex", out var cid) ? cid.GetString() ?? "" : "",
                     TotalRawSize = root.TryGetProperty("total_raw_size", out var trs) ? trs.GetUInt64() : 0UL,
-                    EntryCount = root.TryGetProperty("entry_count", out var ec) ? (uint)ec.GetUInt64() : 0u,
-                    ChunkCount = root.TryGetProperty("chunk_count", out var cc) ? (uint)cc.GetUInt64() : 0u,
-                    ChunkRawSize = root.TryGetProperty("chunk_raw_size", out var crs) ? (uint)crs.GetUInt64() : 0u,
-                    SymbolSize = root.TryGetProperty("symbol_size", out var ss) ? (uint)ss.GetUInt64() : 0u,
-                    LegacyPeerFrames = root.TryGetProperty("legacy_peer_frames", out var lpf) ? (uint)lpf.GetUInt64() : 0u,
+                    EntryCount = root.TryGetProperty("entry_count", out var ec) ? ec.GetUInt32() : 0u,
+                    ChunkCount = root.TryGetProperty("chunk_count", out var cc) ? cc.GetUInt32() : 0u,
+                    ChunkRawSize = root.TryGetProperty("chunk_raw_size", out var crs) ? crs.GetUInt32() : 0u,
+                    SymbolSize = root.TryGetProperty("symbol_size", out var ss) ? ss.GetUInt32() : 0u,
+                    LegacyPeerFrames = root.TryGetProperty("legacy_peer_frames", out var lpf) ? lpf.GetUInt32() : 0u,
                     RootFrameBytes = root.TryGetProperty("root_frame_hex", out var rfh)
                         ? HexToBytes(rfh.GetString() ?? "") : Array.Empty<byte>(),
                 };
@@ -377,7 +379,7 @@ public sealed class ReceiverSession : IDisposable
     {
         var snap = GetSnapshot();
         var nonDir = snap.Entries.Where(e => e.Kind != 3).ToList();
-        if (nonDir.Count == 1) return nonDir[0].Path;
+        if (nonDir.Count == 1) return nonDir[0].SavePath;
         if (nonDir.Count > 1) return $"多文件传输包 ({nonDir.Count} 项)";
         if (snap.EntryCount > 1) return $"多文件传输包 ({snap.EntryCount} 项)";
         return "文件传输";
@@ -395,6 +397,11 @@ public sealed class ReceiverSession : IDisposable
             if (!_initialized) return null;
             int ok = NativeBridge.ReceiverAssembleChunk(_handle, index, out IntPtr buf, out nuint len);
             if (ok == 0 || buf == IntPtr.Zero || len == 0) return null;
+            if (len > int.MaxValue)
+            {
+                NativeBridge.BufferFree(buf, len);
+                return null;
+            }
             try
             {
                 byte[] data = new byte[(int)len];
@@ -488,15 +495,19 @@ public sealed class ReceiverSession : IDisposable
     /// ChunkReady. The gate Monitor is reentrant, so the nested
     /// snapshot/chunk calls under the same gate are safe.
     /// </summary>
-    public void DrainLastChunk(Action<int, int, byte[]> sink)
+    public bool DrainLastChunk(Action<int, int, byte[]> sink)
     {
-        int index = LastChunkIndex();
-        if (index < 0) return;
-        byte[]? bytes = AssembleChunk((uint)index);
-        if (bytes is null) return;
-        int chunkRawSize = unchecked((int)GetSnapshot().ChunkRawSize);
-        sink(index, chunkRawSize, bytes);
-        ForgetChunk((uint)index);
+        lock (_gate)
+        {
+            int index = LastChunkIndex();
+            if (index < 0) return false;
+            uint rawSize = GetSnapshot().ChunkRawSize;
+            if (rawSize == 0 || rawSize > int.MaxValue) return false;
+            byte[]? bytes = AssembleChunk((uint)index);
+            if (bytes is null) return false;
+            sink(index, (int)rawSize, bytes);
+            return ForgetChunk((uint)index);
+        }
     }
 
     /// <summary>This object's transmitted payload length.</summary>

@@ -262,7 +262,10 @@ pub unsafe extern "C" fn airferry_receiver_last_chunk_index(
         return -1;
     }
     let session = unsafe { &*handle };
-    session.last_completed_chunk_index().map(|i| i as i32).unwrap_or(-1)
+    session
+        .last_completed_chunk_index()
+        .and_then(|i| i32::try_from(i).ok())
+        .unwrap_or(-1)
 }
 
 /// Release a persisted chunk from native memory (eviction). Returns 1 when the
@@ -365,14 +368,18 @@ pub unsafe extern "C" fn airferry_decompress_stream_to_file(
         }
         // SAFETY: caller guarantees NUL-terminated C strings.
         let bytes = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_bytes();
-        Some(String::from_utf8_lossy(bytes).into_owned())
+        std::str::from_utf8(bytes).ok().map(str::to_owned)
     }
     let (Some(input), Some(output), Some(expected_sha)) =
         (cstr(input_path), cstr(output_path), cstr(expected_sha_hex))
     else {
-        cffi_log("decompress_stream_to_file: missing argument");
+        cffi_log("decompress_stream_to_file: missing or non-UTF-8 argument");
         return 0;
     };
+    if expected_sha.len() != 64 || !expected_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        cffi_log("decompress_stream_to_file: expected SHA-256 must be 64 hex digits");
+        return 0;
+    }
     // Apply the same hard ceiling as the in-memory C ABI. `max_output` comes
     // from the host process and must not be able to turn this streaming helper
     // into an unlimited disk-filling decompression oracle.
@@ -832,7 +839,7 @@ mod tests {
     fn streaming_decompress_clamps_the_host_supplied_disk_budget() {
         let input = std::ffi::CString::new("missing-input.af2").unwrap();
         let output = std::ffi::CString::new("unused-output.af2").unwrap();
-        let sha = std::ffi::CString::new("").unwrap();
+        let sha = std::ffi::CString::new("00".repeat(32)).unwrap();
         // The size gate must run before opening either path. This both proves
         // the hard receiver ceiling is applied to the streaming C ABI and
         // keeps the test independent of the filesystem.

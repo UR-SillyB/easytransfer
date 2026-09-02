@@ -398,7 +398,7 @@ public sealed class ContinuousSaver
                 IsBundle: false);
             return Skip(displayName, size, hash);
         }
-        WriteAtomic(target, bytes);
+        WriteBytesAtomic(target, bytes, overwriteExisting: false);
         _saved[hash] = new SavedRecord(target, IsBundle: false);
         return new ContinuousSaveReport(
             ContinuousSaveStatus.Saved, target, Path.GetFileName(target), size, hash);
@@ -680,9 +680,10 @@ public sealed class ContinuousSaver
                     updatedAt = e.UpdatedAt,
                 }).ToArray(),
             };
-            WriteAtomic(
+            WriteBytesAtomic(
                 Path.Combine(_dir, IndexFileName),
-                JsonSerializer.SerializeToUtf8Bytes(payload));
+                JsonSerializer.SerializeToUtf8Bytes(payload),
+                overwriteExisting: true);
         }
         catch
         {
@@ -794,7 +795,16 @@ public sealed class ContinuousSaver
         }
     }
 
-    private static void WriteAtomic(string path, byte[] bytes)
+    /// <summary>
+    /// Atomically publish bytes. Received user content must pass
+    /// <paramref name="overwriteExisting"/> = false: another process may
+    /// create the chosen name after ResolveTarget checks it, and that race
+    /// must fail without replacing the user's file. The private dedup index is
+    /// the only caller allowed to atomically replace its previous generation.
+    /// Internal so the pure-C# test project can exercise the collision gate.
+    /// </summary>
+    internal static void WriteBytesAtomic(
+        string path, byte[] bytes, bool overwriteExisting)
     {
         string? dir = Path.GetDirectoryName(path);
         if (dir is null) throw new IOException("目标路径没有目录");
@@ -808,7 +818,7 @@ public sealed class ContinuousSaver
                 stream.Write(bytes);
                 stream.Flush(flushToDisk: true);
             }
-            File.Move(temp, path, overwrite: true);
+            File.Move(temp, path, overwrite: overwriteExisting);
         }
         finally
         {

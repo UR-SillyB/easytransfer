@@ -51,6 +51,17 @@ public partial class App : Application
         }
         try
         {
+            // Fully materialized receive entries may outlive a failed/crashed
+            // ContentStore index commit. Their sidecar carries all logical
+            // metadata needed for an idempotent publication retry.
+            PendingRecoveryStore.RetryAll();
+        }
+        catch
+        {
+            // Non-fatal: retain the staged transaction for the next launch.
+        }
+        try
+        {
             ShareExport.PruneExpired();
         }
         catch

@@ -85,6 +85,11 @@ let preManifestChunks: Set<number> | null = null
 let manifestDecoded = false
 let resumeChecked = false
 let ingestPaused = false
+/** A result has been posted but the UI has not yet acknowledged ownership.
+ * Keep the resume ledger until that acknowledgement: terminating/crashing the
+ * worker between assembly and UI delivery must remain an at-least-once
+ * recovery, not turn a complete transfer into an unresumable orphan spill. */
+let pendingResultAckJobId: number | null = null
 
 async function getOpfsDir(): Promise<FileSystemDirectoryHandle | null> {
   if (opfsDirHandle) return opfsDirHandle
@@ -115,8 +120,31 @@ async function dropSession(): Promise<void> {
   manifestDecoded = false
   invalidateMetaCache()
   ingestPaused = false
+  const resultWasPending = pendingResultAckJobId !== null
+  let mayDiscardJournal = true
+  if (resultWasPending) {
+    // A reset can overtake UI acknowledgement only during teardown/crash-like
+    // paths. Persist the lazy-Blob release moment before deleting the sole
+    // resume record. If OPFS cannot create that marker, preserve the valid
+    // ledger so the old backing remains protected across Worker replacement.
+    mayDiscardJournal = await chunkStore.release()
+  }
   await chunkStore.discard()
-  await journal.discard()
+  if (mayDiscardJournal) {
+    await journal.discard()
+  } else {
+    post({
+      type: "warn",
+      message: "接收结果已交付，但释放标记持久化失败；已保留断点账本以保护下载数据",
+      jobId: pendingResultAckJobId,
+    })
+  }
+  // A deliberately preserved journal must not stay logically bound to the
+  // next session: same-transfer init is idempotent and would otherwise append
+  // to the completed transfer's old ledger without a fresh header.
+  chunkStore = new ChunkStore()
+  journal = new OpfsJournal()
+  pendingResultAckJobId = null
 }
 
 function readMeta(s: ReceiverSessionWasm): MetaInfo {
@@ -179,6 +207,7 @@ async function discardResumeCandidate(
   if (!dir) return
   try { await dir.removeEntry(`af2-${transferIdHex}.ledger.jsonl`) } catch {}
   try { await dir.removeEntry(`af2-${transferIdHex}.partial`) } catch {}
+  try { await dir.removeEntry(`af2-${transferIdHex}.released`) } catch {}
 }
 
 async function tryResume(): Promise<void> {
@@ -328,6 +357,9 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
     }
     if (chunkReady) {
       const idx = session.last_chunk_index()
+      if (idx < 0) {
+        throw new Error("AF2 native state reported chunkReady without a completed chunk index")
+      }
       if (!manifestDecoded) {
         ;(preManifestChunks ??= new Set<number>()).add(idx)
       }
@@ -340,7 +372,9 @@ async function ingestBatch(frames: Uint8Array[], jobId: number): Promise<{
         if (!chunkStore.has(idx)) {
           const dir = await getOpfsDir()
           await chunkStore.init(dir, snap.transferIdHex)
-          const storage = chunkStore.writeChunk(idx, snap.chunkRawSize, bytes)
+          const storage = chunkStore.writeChunk(
+            idx, snap.chunkRawSize, bytes, snap.totalRawSize
+          )
           // Only durable OPFS chunks belong in the crash-resume ledger. A
           // memory fallback is valid for the current session but must be
           // retransmitted after a crash.
@@ -531,6 +565,40 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
     return
   }
 
+  if (data.type === "result_ack") {
+    const jobId = typeof data.jobId === "number" ? data.jobId : activeJobId
+    if (jobId !== activeJobId || pendingResultAckJobId !== jobId) return
+    // First detach the lazy Blob backing without unlinking it. If this worker
+    // is terminated during the following async ledger deletion, the UI-owned
+    // Blob still has a grace-protected partial instead of an unmarked orphan.
+    const releaseMarked = await chunkStore.release()
+    if (!releaseMarked) {
+      // Deleting the journal now would leave an old-mtime partial looking like
+      // an expired orphan after ReceivePage replaces this Worker. Retain the
+      // valid ledger and retry cleanup on the next reset instead.
+      post({
+        type: "warn",
+        message: "接收结果已交付，但释放标记持久化失败；已保留断点账本以保护下载数据",
+        jobId,
+      })
+      return
+    }
+    try {
+      await journal.discard()
+      pendingResultAckJobId = null
+    } catch (err) {
+      // The result is already owned by the UI. Keep the valid ledger for a
+      // later reset/retry instead of pretending cleanup succeeded and losing
+      // the only crash-resume record.
+      post({
+        type: "warn",
+        message: `接收结果已交付，但断点账本清理失败: ${err instanceof Error ? err.message : String(err)}`,
+        jobId,
+      })
+    }
+    return
+  }
+
   if (data.type === "ingest" || data.type === "frames") {
     const frames = (data.frames || data.payloads || []) as Uint8Array[]
     const jobId = typeof data.jobId === "number" ? data.jobId : activeJobId
@@ -569,6 +637,10 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
     if (jobId !== activeJobId) return
     if (!session) return
     try {
+      // Also retry a handle reopen at the start: the immediate recovery in a
+      // previous catch may have lost a transient exclusivity race with stale
+      // File snapshots from that failed materialization attempt.
+      await chunkStore.reopenAfterBlobReadFailure()
       const meta = readMetaCached(session, true)
       for (let i = 0; i < meta.chunkCount; i++) {
         if (!chunkStore.has(i)) {
@@ -685,19 +757,21 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
         }
       }
 
-      // Delivered Blobs lazily reference the OPFS .partial file — deleting it
-      // now would break the user's download. Drop only the resume ledger and
-      // release the exclusive handle; the .partial is removed on the next
-      // init/reset (dropSession) or by the init-time orphan sweep.
-      await journal.discard()
-      chunkStore.release()
-
+      // Do not discard the resume ledger until the UI acknowledges this
+      // message. A worker/page crash after assembly but before delivery must
+      // be resumable. The acknowledgement also calls ChunkStore.release(),
+      // preserving the lazy OPFS Blob backing for subsequent downloads.
+      pendingResultAckJobId = jobId
       post({
         type: "result",
         recovered,
         jobId,
       })
     } catch (err) {
+      // prepareBlobReads() closes the exclusive OPFS handle before creating
+      // lazy result Blobs. If any later entry read fails, restore disk-chunk
+      // readability so a user retry does not invalidate otherwise-good chunks.
+      await chunkStore.reopenAfterBlobReadFailure()
       post({
         type: "error",
         message: `组装失败: ${err instanceof Error ? err.message : String(err)}`,

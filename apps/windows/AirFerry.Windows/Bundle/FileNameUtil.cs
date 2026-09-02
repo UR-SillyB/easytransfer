@@ -125,16 +125,37 @@ public static class FileNameUtil
         string dir = rootDir;
         for (int i = 0; i < parts.Length - 1; i++)
         {
-            dir = Path.Combine(dir, parts[i]);
+            string next = Path.Combine(dir, parts[i]);
+            if (!IsWithin(rootDir, next))
+            {
+                return UniqueTarget(rootDir, FallbackName);
+            }
+            if (PathOccupied(next))
+            {
+                if (!Directory.Exists(next))
+                {
+                    throw new IOException($"接收路径的目录位置已被文件占用: {parts[i]}");
+                }
+                // A lexical StartsWith check does not constrain a junction or
+                // symlink's physical target. Never follow attacker-selected
+                // bundle components through a pre-existing reparse directory.
+                if (IsLinkOrReparsePoint(next))
+                {
+                    throw new IOException($"接收路径不允许符号链接或重解析目录: {parts[i]}");
+                }
+            }
+            else
+            {
+                Directory.CreateDirectory(next);
+                // Recheck after creation so a concurrent replacement fails
+                // closed before a member file is materialized.
+                if (IsLinkOrReparsePoint(next))
+                {
+                    throw new IOException($"接收路径不允许符号链接或重解析目录: {parts[i]}");
+                }
+            }
+            dir = next;
         }
-        if (!IsWithin(rootDir, dir) && !string.Equals(
-                Path.GetFullPath(rootDir).TrimEnd(Path.DirectorySeparatorChar),
-                Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar),
-                StringComparison.OrdinalIgnoreCase))
-        {
-            return UniqueTarget(rootDir, FallbackName);
-        }
-        Directory.CreateDirectory(dir);
         return UniqueTarget(dir, parts[^1]);
     }
 
@@ -152,7 +173,7 @@ public static class FileNameUtil
         {
             return Path.Combine(dir, FallbackName);
         }
-        if (!File.Exists(first))
+        if (!PathOccupied(first))
         {
             return first;
         }
@@ -172,15 +193,82 @@ public static class FileNameUtil
             extPart = string.Empty;
         }
 
-        int i = 1;
-        string candidate;
-        do
+        for (int i = 1; i < 10_000; i++)
         {
-            candidate = Path.Combine(dir, $"{basePart}({i}){extPart}");
-            i++;
+            string candidate = Path.Combine(dir, $"{basePart}({i}){extPart}");
+            if (!PathOccupied(candidate))
+            {
+                return candidate;
+            }
         }
-        while (File.Exists(candidate));
-        return candidate;
+        throw new IOException($"目标目录同名文件过多: {safe}");
+    }
+
+    private static bool PathOccupied(string path)
+    {
+        if (File.Exists(path) || Directory.Exists(path))
+        {
+            return true;
+        }
+        try
+        {
+            // File.Exists follows links and therefore reports false for a
+            // dangling symlink. Attributes/LinkTarget still see the directory
+            // entry; treating it as free could make a create/truncate writer
+            // follow the link outside the chosen destination.
+            _ = File.GetAttributes(path);
+            return true;
+        }
+        catch (FileNotFoundException)
+        {
+            return HasLinkTarget(path);
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return HasLinkTarget(path);
+        }
+        catch
+        {
+            // Inaccessible is not equivalent to absent. Fail closed and let
+            // the suffix loop choose a different, inspectable path.
+            return true;
+        }
+    }
+
+    private static bool HasLinkTarget(string path)
+    {
+        try
+        {
+            return new FileInfo(path).LinkTarget is not null ||
+                   new DirectoryInfo(path).LinkTarget is not null;
+        }
+        catch (FileNotFoundException)
+        {
+            return false;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return false;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    private static bool IsLinkOrReparsePoint(string path)
+    {
+        try
+        {
+            return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0 ||
+                   new DirectoryInfo(path).LinkTarget is not null;
+        }
+        catch
+        {
+            // The caller has just observed/created this directory. Losing the
+            // ability to inspect it is a race, not permission to write into it.
+            return true;
+        }
     }
 
     private static bool IsIllegalFileNameChar(char c)

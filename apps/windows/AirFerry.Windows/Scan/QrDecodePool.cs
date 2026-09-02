@@ -18,6 +18,7 @@ public sealed class QrDecodePool : IDisposable
     private const int IngestBatch = 4;
     private const int MultiFullDecodeEvery = 3;
     private const int MultiPeriodicFullEvery = 30;
+    private const int PartialFullDecodeEvery = 5;
     private const int TrackShrinkAfterFullScans = 3;
     private const float TrackMargin = 0.35F;
 
@@ -33,6 +34,7 @@ public sealed class QrDecodePool : IDisposable
     private long _droppedFrames;
     private long _decodedSymbols;
     private long _multiMisses;
+    private long _partialMisses;
     private long _multiFrames;
     private int[]? _multiTrackedBboxes;
     private int _multiLockedCount;
@@ -256,10 +258,12 @@ public sealed class QrDecodePool : IDisposable
         // fast path exists to avoid. Only miss counts that are > 0 and land on
         // the boundary trigger the cold path (mirrors Android's fix).
         long misses = Interlocked.Read(ref _multiMisses);
+        long partialMisses = Interlocked.Read(ref _partialMisses);
         long frameOrdinal = Interlocked.Increment(ref _multiFrames);
         bool dueFullLock = tracked is null || lockedCount == 0 ||
             frameOrdinal % MultiPeriodicFullEvery == 0 ||
-            (misses > 0 && misses % MultiFullDecodeEvery == 0);
+            (misses > 0 && misses % MultiFullDecodeEvery == 0) ||
+            (partialMisses > 0 && partialMisses % PartialFullDecodeEvery == 0);
         if (!dueFullLock && tracked is not null && lockedCount > 0)
         {
             List<ZxingDecoder.MultiResult> regionResults = ZxingDecoder.DecodeMulti(
@@ -268,6 +272,14 @@ public sealed class QrDecodePool : IDisposable
             if (regionResults.Count > 0)
             {
                 UpdateTrackedSlots(regionResults);
+                if (regionResults.Count < lockedCount)
+                {
+                    Interlocked.Increment(ref _partialMisses);
+                }
+                else
+                {
+                    Interlocked.Exchange(ref _partialMisses, 0);
+                }
                 Interlocked.Exchange(ref _multiMisses, 0);
                 return regionResults;
             }
@@ -284,6 +296,7 @@ public sealed class QrDecodePool : IDisposable
         {
             Interlocked.Increment(ref _multiMisses);
         }
+        Interlocked.Exchange(ref _partialMisses, 0);
         return fullResults;
     }
 

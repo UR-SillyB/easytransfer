@@ -155,6 +155,28 @@ public class ContinuousSaverTests
     }
 
     [Fact]
+    public void WriteBytesAtomic_ContentCollision_DoesNotOverwriteExistingFile()
+    {
+        string root = TempRoot();
+        Directory.CreateDirectory(root);
+        string target = Path.Combine(root, "valuable.txt");
+        try
+        {
+            File.WriteAllBytes(target, [9, 9, 9]);
+
+            Assert.Throws<IOException>(() => ContinuousSaver.WriteBytesAtomic(
+                target, [1, 2, 3], overwriteExisting: false));
+
+            Assert.Equal(new byte[] { 9, 9, 9 }, File.ReadAllBytes(target));
+            Assert.Empty(Directory.GetFiles(root, "*.tmp"));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public void SaveBundle_CreatesSubfolderWithMembers()
     {
         string root = TempRoot();

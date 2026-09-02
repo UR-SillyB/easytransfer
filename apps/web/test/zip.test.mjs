@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { createZipBlob, crc32 } from "../src/lib/zip.ts"
+import { createZipBlob, crc32, sanitizeZipEntryPath } from "../src/lib/zip.ts"
 
 test("crc32 calculates correct IEEE standard checksum", () => {
   const encoder = new TextEncoder()
@@ -62,4 +62,52 @@ test("createZipBlob emits ZIP64 fields for a >= 0xffffffff-byte entry without al
   }
   assert.ok(findSig(0x06064b50) >= 0, "ZIP64 EOCD must be present")
   assert.ok(findSig(0x07064b50) >= 0, "ZIP64 locator must be present")
+})
+
+test("sanitizeZipEntryPath strips traversal, roots and control characters", () => {
+  assert.equal(sanitizeZipEntryPath("sub/test.json"), "sub/test.json")
+  assert.equal(sanitizeZipEntryPath("a\\b\\c.txt"), "a/b/c.txt")
+  assert.equal(sanitizeZipEntryPath("../../etc/passwd"), "etc/passwd")
+  assert.equal(sanitizeZipEntryPath("/etc/passwd"), "etc/passwd")
+  assert.equal(sanitizeZipEntryPath("C:\\Windows\\system32\\evil.dll"), "Windows/system32/evil.dll")
+  assert.equal(sanitizeZipEntryPath("a/./b/../c.txt"), "a/b/c.txt")
+  assert.equal(sanitizeZipEntryPath("bad\u0000name.txt"), "badname.txt")
+  // A name consisting solely of traversal tokens must still yield a usable member.
+  assert.equal(sanitizeZipEntryPath("../.."), "unnamed")
+  assert.equal(sanitizeZipEntryPath(""), "unnamed")
+})
+
+test("createZipBlob never writes a traversal member name", async () => {
+  const encoder = new TextEncoder()
+  const blob = await createZipBlob([
+    { name: "../../../evil.sh", data: encoder.encode("x") },
+  ])
+  const buf = new Uint8Array(await blob.arrayBuffer())
+  const view = new DataView(buf.buffer)
+  const nameLen = view.getUint16(26, true)
+  const name = new TextDecoder().decode(buf.subarray(30, 30 + nameLen))
+  assert.equal(name, "evil.sh")
+  assert.ok(!name.includes(".."), "archive member must not contain a traversal token")
+})
+
+test("createZipBlob keeps names unique after sanitization and case folding", async () => {
+  const blob = await createZipBlob([
+    { name: "C:report.txt", data: Uint8Array.from([1]) },
+    { name: "report.txt", data: Uint8Array.from([2]) },
+    { name: "REPORT (1).txt", data: Uint8Array.from([3]) },
+  ])
+  const bytes = new Uint8Array(await blob.arrayBuffer())
+  const view = new DataView(bytes.buffer)
+  const names = []
+  let offset = 0
+  for (let i = 0; i < 3; i++) {
+    assert.equal(view.getUint32(offset, true), 0x04034b50)
+    const compressedSize = view.getUint32(offset + 18, true)
+    const nameLength = view.getUint16(offset + 26, true)
+    const extraLength = view.getUint16(offset + 28, true)
+    names.push(new TextDecoder().decode(bytes.subarray(offset + 30, offset + 30 + nameLength)))
+    offset += 30 + nameLength + extraLength + compressedSize
+  }
+  assert.deepEqual(names, ["report.txt", "report (1).txt", "REPORT (1) (1).txt"])
+  assert.equal(new Set(names.map((name) => name.toLowerCase())).size, names.length)
 })

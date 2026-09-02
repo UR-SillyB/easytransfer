@@ -8,7 +8,8 @@ namespace AirFerry.Windows.Scan;
 /// Crash-safe §12 resume ledger — the journal twin of <see cref="ChunkSpillStore"/>'s
 /// <c>.partial</c> file. JSONL, one file per transfer (<c>af2-&lt;tid&gt;.ledger.jsonl</c>):
 /// <para>
-/// Line 1 (header): <c>{"v":1,"tid":…,"root":…,"crs":…}</c> — written atomically
+/// Line 1 (header): <c>{"v":1,"tid":…,"rid":…,"root":…,"crs":…}</c> — <c>rid</c>
+/// identifies this receive attempt (legacy headers omit it); written atomically
 /// (temp + flush + rename) before the first chunk commit. Each later line is
 /// <c>{"c":i}</c> (chunk committed after its bytes were pwrite+fsync'd into the
 /// spill) or <c>{"i":i}</c> (chunk invalidated after a re-verification failure).
@@ -30,6 +31,9 @@ public sealed class Af2LedgerStore
 
     private readonly string _path;
     public string TransferIdHex { get; private set; } = "";
+    /// <summary>Identity of one receive attempt; survives restart but changes
+    /// when the same Transfer is intentionally received again.</summary>
+    public string RecoveryId { get; private set; } = "";
     public int ChunkRawSize { get; private set; }
     public byte[] RootFrameBytes { get; private set; } = Array.Empty<byte>();
     public SortedSet<int> Completed { get; } = new();
@@ -49,6 +53,7 @@ public sealed class Af2LedgerStore
     {
         Completed.Clear();
         TransferIdHex = "";
+        RecoveryId = "";
         ChunkRawSize = 0;
         RootFrameBytes = [];
         _headerDurable = false;
@@ -104,6 +109,10 @@ public sealed class Af2LedgerStore
         string parsedTid = header.TryGetProperty("tid", out JsonElement tid) &&
             tid.ValueKind == JsonValueKind.String
             ? tid.GetString() ?? "" : "";
+        bool hasRecoveryId = header.TryGetProperty("rid", out JsonElement rid);
+        string parsedRecoveryId = hasRecoveryId && rid.ValueKind == JsonValueKind.String
+            ? rid.GetString() ?? ""
+            : hasRecoveryId ? "" : parsedTid;
         int parsedChunkRawSize = header.TryGetProperty("crs", out JsonElement crs) &&
             crs.TryGetInt32(out int crsValue) ? crsValue : 0;
         string rootHex = header.TryGetProperty("root", out JsonElement root) &&
@@ -111,10 +120,11 @@ public sealed class Af2LedgerStore
             ? root.GetString() ?? "" : "";
         byte[] parsedRoot = rootHex.Length <= MaxRootFrameBytes * 2
             ? HexToBytes(rootHex) : [];
-        if (headerProperties.Length != 4 ||
+        if (headerProperties.Length != (hasRecoveryId ? 5 : 4) ||
             !header.TryGetProperty("v", out JsonElement version) ||
             !version.TryGetInt32(out int versionValue) || versionValue != 1 ||
             fileTid is null || !string.Equals(parsedTid, fileTid, StringComparison.Ordinal) ||
+            !IsSafeRecoveryId(parsedRecoveryId) ||
             !LegalChunkRawSizes.Contains(parsedChunkRawSize) ||
             parsedRoot.Length == 0)
         {
@@ -174,6 +184,7 @@ public sealed class Af2LedgerStore
         // A journal that reloads with a valid header is durable by definition —
         // resumed transfers keep appending to it.
         TransferIdHex = parsedTid;
+        RecoveryId = parsedRecoveryId;
         ChunkRawSize = parsedChunkRawSize;
         RootFrameBytes = parsedRoot;
         Completed.UnionWith(parsedCompleted);
@@ -245,6 +256,7 @@ public sealed class Af2LedgerStore
             var list = new List<PendingTransfer>();
             foreach (var file in Directory.EnumerateFiles(dir, "af2-*.ledger.jsonl"))
             {
+                if (TransferIdFromLedgerName(Path.GetFileName(file)) is null) continue;
                 var store = new Af2LedgerStore(file);
                 if (store.Reload())
                 {
@@ -295,7 +307,8 @@ public sealed class Af2LedgerStore
                 return null;
             }
             foreach (FileInfo candidate in new DirectoryInfo(dir)
-                         .EnumerateFiles("*.ledger.jsonl")
+                         .EnumerateFiles("af2-*.ledger.jsonl")
+                         .Where(f => TransferIdFromLedgerName(f.Name) is not null)
                          .OrderByDescending(f => f.LastWriteTimeUtc))
             {
                 try
@@ -323,8 +336,9 @@ public sealed class Af2LedgerStore
         try
         {
             var validTids = new HashSet<string>(StringComparer.Ordinal);
-            foreach (string journal in Directory.EnumerateFiles(dir, "*.ledger.jsonl"))
+            foreach (string journal in Directory.EnumerateFiles(dir, "af2-*.ledger.jsonl"))
             {
+                if (TransferIdFromLedgerName(Path.GetFileName(journal)) is null) continue;
                 var store = new Af2LedgerStore(journal);
                 if (store.Reload())
                 {
@@ -357,15 +371,19 @@ public sealed class Af2LedgerStore
         if (rootFrameBytes.Length == 0 || rootFrameBytes.Length > MaxRootFrameBytes)
             throw new ArgumentException("Invalid AF2 ROOT frame", nameof(rootFrameBytes));
         string path = Path.Combine(dir, $"af2-{transferIdHex}.ledger.jsonl");
-        try { File.Delete(path); } catch (IOException) { }
+        string recoveryId = Guid.NewGuid().ToString("N");
         string header = JsonSerializer.Serialize(new
         {
             v = 1,
             tid = transferIdHex,
+            rid = recoveryId,
             crs = chunkRawSize,
             root = BytesToHex(rootFrameBytes),
         });
-        string tmp = path + ".tmp";
+        // A unique temp avoids stale/concurrent temp collisions. Keep any
+        // existing same-transfer ledger until the new header is flushed and
+        // ready to replace it, so a failed relock cannot erase resumable work.
+        string tmp = $"{path}.{Guid.NewGuid():N}.tmp";
         try
         {
             Directory.CreateDirectory(dir);
@@ -385,6 +403,7 @@ public sealed class Af2LedgerStore
         return new Af2LedgerStore(path)
         {
             TransferIdHex = transferIdHex,
+            RecoveryId = recoveryId,
             ChunkRawSize = chunkRawSize,
             RootFrameBytes = rootFrameBytes.ToArray(),
             _headerDurable = true,
@@ -421,7 +440,9 @@ public sealed class Af2LedgerStore
         return IsSafeTransferId(id) ? id : null;
     }
 
-    private static bool IsSafeTransferId(string id) =>
+    internal static bool IsSafeTransferId(string id) =>
         id.Length is >= 1 and <= 64 && id.All(c =>
             char.IsAsciiLetterOrDigit(c) || c is '_' or '-');
+
+    private static bool IsSafeRecoveryId(string id) => IsSafeTransferId(id);
 }

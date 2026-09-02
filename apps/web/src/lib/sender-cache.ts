@@ -22,6 +22,10 @@ const DB_NAME = "airferry-sender-cache"
 const STORE = "manifest-cache"
 const MAX_ENTRIES = 40
 const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
+// Must match af2::manifest::MAX_MANIFEST_BYTES. Reject before passing an
+// IndexedDB value through wasm-bindgen: the JS→WASM string copy happens before
+// Rust can enforce its own parser/allocation cap.
+const MAX_MANIFEST_HEX_CHARS = (16 * 1024 * 1024) * 2
 
 export interface CachedManifest {
   manifestHex: string
@@ -67,7 +71,11 @@ function getOne(database: IDBDatabase, key: string): Promise<CachedManifest | nu
         | { manifestHex?: string; chunkRawSize?: number }
         | undefined
       resolve(
-        rec && typeof rec.manifestHex === "string" && typeof rec.chunkRawSize === "number"
+        rec &&
+          typeof rec.manifestHex === "string" &&
+          rec.manifestHex.length % 2 === 0 &&
+          rec.manifestHex.length <= MAX_MANIFEST_HEX_CHARS &&
+          typeof rec.chunkRawSize === "number"
           ? { manifestHex: rec.manifestHex, chunkRawSize: rec.chunkRawSize }
           : null
       )

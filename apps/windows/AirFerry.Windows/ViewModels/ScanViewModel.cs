@@ -779,6 +779,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 // replayed META for an already-done chunk is dropped. Clear the
                 // bit now so the next sender epoch can really re-supply it.
                 session.InvalidateChunk((uint)i);
+                spill.Invalidate(i);
                 ledger.Invalidate(i);
                 System.Diagnostics.Debug.WriteLine(
                     $"[Af2] resumed chunk {i} missing/corrupt; invalidated for re-supply");
@@ -851,24 +852,34 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             try
             {
                 ReceiverSession.Snapshot snap = session.GetSnapshot();
-                ChunkSpillStore spill = _chunkSpill ??= new ChunkSpillStore(
-                    TempDir, snap.TransferIdHex);
-                session.DrainLastChunk((index, chunkRawSize, bytes) =>
+                if (string.IsNullOrEmpty(snap.TransferIdHex) || snap.ChunkRawSize == 0 ||
+                    snap.ChunkRawSize > int.MaxValue || snap.RootFrameBytes.Length == 0)
                 {
-                    spill.Write(index, chunkRawSize, bytes);
-                    // Commit while the native chunk is still resident.
-                    // DrainLastChunk evicts only after this callback returns,
-                    // so a journal failure leaves a retryable in-memory copy.
+                    throw new IOException("AF2 snapshot unavailable for completed chunk");
+                }
+                bool drained = session.DrainLastChunk((index, chunkRawSize, bytes) =>
+                {
+                    // The replacement header becomes durable before a fresh
+                    // spill constructor may delete stale same-transfer bytes.
+                    // Commit still follows spill Flush(true), preserving the
+                    // ledger-complete => data-durable invariant.
                     Af2LedgerStore ledger = _af2Ledger ??= Af2LedgerStore.Create(
                         TempDir, snap.TransferIdHex, (int)snap.ChunkRawSize, snap.RootFrameBytes);
+                    ChunkSpillStore spill = _chunkSpill ??= new ChunkSpillStore(
+                        TempDir, snap.TransferIdHex);
+                    spill.Write(index, chunkRawSize, bytes);
                     ledger.Commit(index);
                 });
+                if (!drained)
+                {
+                    throw new IOException("Completed AF2 chunk could not be drained");
+                }
             }
             catch (Exception ex)
             {
                 // Continuing would retain every later completed chunk in native
-                // memory. Pause ingest with the current chunk still resident and
-                // surface an actionable storage error instead.
+                // memory. Pause on storage, snapshot, or drain failures with the
+                // current chunk still resident and surface an actionable error.
                 pool.IngestStopped = true;
                 System.Diagnostics.Debug.WriteLine($"chunk spill failed: {ex.Message}");
                 System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
@@ -947,7 +958,20 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         }
         catch (Exception ex)
         {
-            ResetReceiverAfterRecoveryFailure(session, pool, epoch);
+            if (ex is RecoveryPublicationException { DurableStage: false })
+            {
+                // The complete entry could not acquire its retry manifest.
+                // Keep the still-resumable native session + spill/ledger and
+                // let a later frame retry instead of deleting the only copy.
+                pool.IngestStopped = false;
+                Interlocked.Exchange(ref _recoveryStarted, 0);
+            }
+            else
+            {
+                // A durable stage manifest owns publication failures from here;
+                // other verification/assembly errors still need a clean reset.
+                ResetReceiverAfterRecoveryFailure(session, pool, epoch);
+            }
             if (epoch == Volatile.Read(ref _sessionEpoch))
             {
                 IsComplete = false;
@@ -994,13 +1018,9 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                     throw new InvalidOperationException(
                         "最终校验失败，请对准二维码重新接收");
                 }
-                // Consumed: staging may still fail, but the failure path resets
-                // the whole receiver anyway, so no retry needs this file.
-                spill.Discard();
-                _chunkSpill = null;
-                _af2Ledger?.Discard();
-                _af2Ledger = null;
-                _pendingReverify = null;
+                // Verification is not publication. Keep the only resumable
+                // spill/ledger pair until ContentStore (or the continuous
+                // destination) has committed successfully below.
                 return fromFile;
             }
         }
@@ -1080,12 +1100,21 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         ulong receivedCrc = Crc32.Compute(payload.Bytes);
         ClassifiedPayload classified = ClassifyAf2Recovered(
             payload.Bytes, entries, payload.DisplayName);
-        if (saver is not null)
+        string recoveryKey = StableRecoveryKey(spillSnapshot, _af2Ledger);
+        RecoveryOutcome outcome = saver is not null
+            ? RecoveryOutcome.Continuous(TrySaveContinuous(saver, classified))
+            : RecoveryOutcome.Single(StageClassified(
+                classified, payload.ExpectedCrc, payload.CrcKnown, receivedCrc,
+                recoveryKey));
+        if (outcome.ContinuousReport is not { Status: ContinuousSaveStatus.Failed })
         {
-            return RecoveryOutcome.Continuous(TrySaveContinuous(saver, classified));
+            _chunkSpill?.Discard();
+            _chunkSpill = null;
+            _af2Ledger?.Discard();
+            _af2Ledger = null;
+            _pendingReverify = null;
         }
-        return RecoveryOutcome.Single(StageClassified(
-            classified, payload.ExpectedCrc, payload.CrcKnown, receivedCrc));
+        return outcome;
     }
 
     /// <summary>
@@ -1101,6 +1130,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         ChunkSpillStore spill,
         ReceiverSession.Snapshot snapshot)
     {
+        string recoveryKey = StableRecoveryKey(snapshot, _af2Ledger);
+        string StableEntryId(int ordinal) => $"af2-{recoveryKey}-{ordinal}";
         var badChunks = new List<uint>();
         // No RunExclusive around the loop: the quiesce barrier in
         // RecoverAndStageCore guarantees no further ingest, and every native
@@ -1145,8 +1176,18 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                     }
                     if (bytes is null)
                     {
-                        verified = false; // missing everywhere despite repair
-                        goto done;
+                        // Missing spill bytes are the same repairable condition
+                        // as a chunk-hash mismatch.  Throwing here used to run
+                        // ResetReceiverAfterRecoveryFailure(), discarding every
+                        // other verified chunk and forcing a full re-receive.
+                        // Clear this one completion bit in both ledgers so the
+                        // sender's next epoch can supply it again.
+                        session.InvalidateChunk(i);
+                        spill.Invalidate((int)i);
+                        _af2Ledger?.Invalidate((int)i);
+                        badChunks.Add(i);
+                        finalVerifyUsable = false;
+                        continue;
                     }
                     if (!session.VerifyChunk(i, bytes))
                     {
@@ -1156,6 +1197,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                         // epoch re-supplies exactly this chunk; failing here would
                         // reset the receiver and force a complete re-receive.
                         session.InvalidateChunk(i);
+                        spill.Invalidate((int)i);
                         // Keep the crash-resume journal in lockstep with native
                         // completion state. Otherwise an app exit before re-supply
                         // would resurrect this corrupt spill chunk as completed.
@@ -1196,9 +1238,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         IReadOnlyList<ReceiverSession.ManifestEntryDto> entries = snapshot.Entries
             .Where(e => e.Kind != 3)
             .ToList();
-        string stageDir = Path.Combine(
-            Path.GetTempPath(), "AirFerry", "recovery", Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(stageDir);
+        string stageDir = PendingRecoveryStore.CreateStageDirectory();
+        bool preserveCompletedStage = false;
 
         BundleFile StageEntry(ReceiverSession.ManifestEntryDto e, int ordinal)
         {
@@ -1245,10 +1286,58 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                     string name = string.IsNullOrEmpty(entries[0].SavePath)
                         ? entries[0].Path
                         : entries[0].SavePath;
-                    RecoveryOutcome outcome = saver is not null
-                        ? RecoveryOutcome.Continuous(GuardedContinuousSave(
-                            saver, name, () => saver.SaveText(name, text)))
-                        : RecoveryOutcome.Single(StageText(text, name, 0, false, 0));
+                    RecoveryOutcome outcome;
+                    if (saver is not null)
+                    {
+                        outcome = RecoveryOutcome.Continuous(GuardedContinuousSave(
+                            saver, name, () => saver.SaveText(name, text)));
+                    }
+                    else
+                    {
+                        string finalName = string.IsNullOrEmpty(name)
+                            ? "文字消息.txt"
+                            : (name.Contains('.') ? name : name + ".txt");
+                        BundleFile stagedText = StageEntry(entries[0], 0);
+                        var request = new ContentStore.PutFileRequest(
+                            finalName, stagedText.StoredPath!,
+                            CrcHex: Crc32.Compute(bytes).ToString("x"),
+                            CrcUnknown: false, Kind: "text",
+                            ExpectedSize: stagedText.Size,
+                            StableEntryId: StableEntryId(0));
+                        try
+                        {
+                            PendingRecoveryStore.Persist(stageDir, [request]);
+                            preserveCompletedStage = true;
+                        }
+                        catch (Exception ex)
+                        {
+                            throw new RecoveryPublicationException(
+                                $"无法持久化接收文件的待提交标记: {stageDir}",
+                                durableStage: false, innerException: ex);
+                        }
+                        ContentStore.PutResult put;
+                        try
+                        {
+                            put = ContentStore.PutFileBatch([request]).Single();
+                        }
+                        catch (Exception ex)
+                        {
+                            throw new RecoveryPublicationException(
+                                $"接收历史提交失败；文字已保留在 {stageDir}: {ex.Message}",
+                                durableStage: true, innerException: ex);
+                        }
+                        preserveCompletedStage = false;
+                        outcome = RecoveryOutcome.Single(new RecoveryResult(
+                            SingleFilePath: put.Path,
+                            SingleFileSize: (ulong)stagedText.Size,
+                            ExpectedCrc32: 0,
+                            Crc32Known: false,
+                            ReceivedCrc32: 0,
+                            Bundle: null,
+                            BundleDir: null,
+                            Text: text,
+                            DisplayName: finalName));
+                    }
                     ConsumeSpillAfterSuccessfulStage(outcome.ContinuousReport);
                     return outcome;
                 }
@@ -1265,10 +1354,34 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 }
                 else
                 {
-                    ContentStore.PutResult put = ContentStore.PutFile(
+                    ContentStore.PutResult put;
+                    var request = new ContentStore.PutFileRequest(
                         file.Name, file.StoredPath!,
-                        crcHex: "unknown", crcUnknown: true, kind: "file",
-                        expectedSize: file.Size);
+                        CrcHex: "unknown", CrcUnknown: true, Kind: "file",
+                        ExpectedSize: file.Size,
+                        StableEntryId: StableEntryId(0));
+                    try
+                    {
+                        PendingRecoveryStore.Persist(stageDir, [request]);
+                        preserveCompletedStage = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new RecoveryPublicationException(
+                            $"无法持久化接收文件的待提交标记: {stageDir}",
+                            durableStage: false, innerException: ex);
+                    }
+                    try
+                    {
+                        put = ContentStore.PutFileBatch([request]).Single();
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new RecoveryPublicationException(
+                            $"接收历史提交失败；文件已保留在 {stageDir}: {ex.Message}",
+                            durableStage: true, innerException: ex);
+                    }
+                    preserveCompletedStage = false;
                     outcome = RecoveryOutcome.Single(new RecoveryResult(
                         SingleFilePath: put.Path,
                         SingleFileSize: (ulong)file.Size,
@@ -1292,12 +1405,17 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 return outcome;
             }
 
-            string bundleId = Guid.NewGuid().ToString("N");
+            // A crash after the one index commit but before ledger deletion
+            // retries this transfer on the next launch. Transfer-derived IDs
+            // make that retry return the committed entries instead of adding
+            // a duplicate bundle.
+            string bundleId = $"af2-{recoveryKey}";
             string bundleTitle = $"发送_{DateTime.Now:MMdd_HHmmss}";
             // One index write for the whole bundle: a mid-bundle disk failure
             // must not leave a truncated bundle committed to history.
-            var stored = ContentStore.PutFileBatch(
-                staged.Select(f => new ContentStore.PutFileRequest(
+            List<BundleFile> stored;
+            List<ContentStore.PutFileRequest> requests = staged
+                .Select((f, index) => new ContentStore.PutFileRequest(
                     DisplayName: f.Name,
                     FilePath: f.StoredPath!,
                     CrcHex: "unknown",
@@ -1305,10 +1423,34 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                     Kind: "file",
                     BundleId: bundleId,
                     BundleTitle: bundleTitle,
-                    ExpectedSize: f.Size)).ToList())
-                .Select(put => new BundleFile(
-                    put.Entry.Name, put.Path, put.Entry.Size))
+                    ExpectedSize: f.Size,
+                    StableEntryId: StableEntryId(index)))
                 .ToList();
+            try
+            {
+                PendingRecoveryStore.Persist(stageDir, requests);
+                preserveCompletedStage = true;
+            }
+            catch (Exception ex)
+            {
+                throw new RecoveryPublicationException(
+                    $"无法持久化接收文件的待提交标记: {stageDir}",
+                    durableStage: false, innerException: ex);
+            }
+            try
+            {
+                stored = ContentStore.PutFileBatch(requests)
+                    .Select(put => new BundleFile(
+                        put.Entry.Name, put.Path, put.Entry.Size))
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                throw new RecoveryPublicationException(
+                    $"接收历史提交失败；完整文件已保留在 {stageDir}: {ex.Message}",
+                    durableStage: true, innerException: ex);
+            }
+            preserveCompletedStage = false;
             ConsumeSpillAfterSuccessfulStage();
             return RecoveryOutcome.Single(new RecoveryResult(
                 SingleFilePath: null,
@@ -1322,7 +1464,11 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         }
         finally
         {
-            try { if (Directory.Exists(stageDir)) Directory.Delete(stageDir, recursive: true); }
+            try
+            {
+                if (!preserveCompletedStage && Directory.Exists(stageDir))
+                    Directory.Delete(stageDir, recursive: true);
+            }
             catch { /* ContentStore/continuous save already owns successful copies. */ }
         }
 
@@ -1385,7 +1531,9 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         if (entries.Count > 1)
         {
             var files = entries
-                .Select(e => new BundleFile(e.Path, Slice(stream, e)))
+                .Select(e => new BundleFile(
+                    string.IsNullOrEmpty(e.SavePath) ? e.Path : e.SavePath,
+                    Slice(stream, e)))
                 .ToList();
             return new ClassifiedPayload(
                 RecoveredKind.Bundle, displayName, (ulong)stream.LongLength, stream, null, files);
@@ -1395,9 +1543,12 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         if (entries.Count == 1)
         {
             byte[] bytes = Slice(stream, entries[0]);
-            string name = string.IsNullOrEmpty(entries[0].Path)
+            string savedName = string.IsNullOrEmpty(entries[0].SavePath)
+                ? entries[0].Path
+                : entries[0].SavePath;
+            string name = string.IsNullOrEmpty(savedName)
                 ? (string.IsNullOrEmpty(displayName) ? "received_file" : displayName)
-                : entries[0].Path;
+                : savedName;
             if (FileNameUtil.IsTextLikeName(name) && FileNameUtil.FitsTextUi(bytes.LongLength))
             {
                 return FileNameUtil.DecodeUtf8Strict(bytes) is { } text
@@ -1431,23 +1582,41 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         public static RecoveryOutcome Continuous(ContinuousSaveReport report) => new(null, report);
     }
 
+    /// <summary>
+    /// Distinguishes a publication failure whose staged files already have a
+    /// durable retry owner from one that must keep the native spill/ledger.
+    /// </summary>
+    private sealed class RecoveryPublicationException : IOException
+    {
+        public RecoveryPublicationException(
+            string message, bool durableStage, Exception innerException)
+            : base(message, innerException)
+        {
+            DurableStage = durableStage;
+        }
+
+        public bool DurableStage { get; }
+    }
+
     /// <summary>Stage a classified payload into the ContentStore (single-receive mode).</summary>
     private RecoveryResult StageClassified(
-        ClassifiedPayload c, ulong expectedCrc, bool crcKnown, ulong receivedCrc)
+        ClassifiedPayload c, ulong expectedCrc, bool crcKnown, ulong receivedCrc,
+        string recoveryKey)
     {
         return c.Kind switch
         {
             RecoveredKind.EtText =>
-                StageText(c.Text!, c.DisplayName, expectedCrc, crcKnown, receivedCrc),
+                StageText(c.Text!, c.DisplayName, expectedCrc, crcKnown, receivedCrc,
+                    recoveryKey),
             RecoveredKind.Bundle =>
-                StageBundle(c.BundleFiles!, expectedCrc, crcKnown, receivedCrc)
+                StageBundle(c.BundleFiles!, expectedCrc, crcKnown, receivedCrc, recoveryKey)
                 ?? StageSingleFile(c.Bytes, c.DisplayName, c.OriginalSize,
-                    expectedCrc, crcKnown, receivedCrc),
+                    expectedCrc, crcKnown, receivedCrc, recoveryKey),
             RecoveredKind.TextLikeFile =>
                 StageTextLikeFile(c.Bytes, c.DisplayName, c.OriginalSize,
-                    expectedCrc, crcKnown, receivedCrc, c.Text!),
+                    expectedCrc, crcKnown, receivedCrc, c.Text!, recoveryKey),
             _ => StageSingleFile(c.Bytes, c.DisplayName, c.OriginalSize,
-                expectedCrc, crcKnown, receivedCrc),
+                expectedCrc, crcKnown, receivedCrc, recoveryKey),
         };
     }
 
@@ -1534,6 +1703,25 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             if (!string.IsNullOrEmpty(snap.TransferIdHex)) return snap.TransferIdHex;
         }
         return session.SessionIdHex();
+    }
+
+    /// <summary>Deterministic namespace for crash-idempotent AF2 history IDs.</summary>
+    private static string StableRecoveryKey(
+        ReceiverSession.Snapshot snapshot, Af2LedgerStore? ledger)
+    {
+        if (ledger is not null &&
+            string.Equals(ledger.TransferIdHex, snapshot.TransferIdHex,
+                StringComparison.Ordinal) &&
+            !string.IsNullOrWhiteSpace(ledger.RecoveryId))
+        {
+            return ledger.RecoveryId;
+        }
+        string key = !string.IsNullOrWhiteSpace(snapshot.TransferIdHex)
+            ? snapshot.TransferIdHex
+            : snapshot.ContentIdHex;
+        if (string.IsNullOrWhiteSpace(key))
+            throw new InvalidDataException("恢复快照缺少 AF2 传输标识");
+        return key;
     }
 
     /// <summary>
@@ -1755,13 +1943,95 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         _recentWireBytesPerSecond = 0;
     }
 
+    /// <summary>
+    /// Publish in-memory recovery bytes through task-owned files. If the one
+    /// ContentStore index commit fails, PutFileBatch retains those sources and
+    /// this method deliberately leaves the unique directory in place instead
+    /// of letting the only recovered copy die with the managed byte arrays.
+    /// </summary>
+    private static IReadOnlyList<ContentStore.PutResult> PublishRecoveredBytes(
+        IReadOnlyList<ContentStore.PutBytesRequest> requests)
+    {
+        if (requests.Count == 0) return [];
+        string stageDir = PendingRecoveryStore.CreateStageDirectory();
+        var sources = new List<string>(requests.Count);
+        bool preserveCompletedStage = false;
+        try
+        {
+            for (int i = 0; i < requests.Count; i++)
+            {
+                string source = Path.Combine(stageDir, $"{i:D6}.partial");
+                using (var stream = new FileStream(
+                           source, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                           1024 * 1024, FileOptions.WriteThrough))
+                {
+                    stream.Write(requests[i].Bytes);
+                    stream.Flush(flushToDisk: true);
+                }
+                sources.Add(source);
+            }
+
+            List<ContentStore.PutFileRequest> fileRequests = requests
+                .Select((request, i) => new ContentStore.PutFileRequest(
+                    request.DisplayName,
+                    sources[i],
+                    request.CrcHex,
+                    request.CrcUnknown,
+                    request.Kind,
+                    request.BundleId,
+                    request.BundleTitle,
+                    request.Bytes.LongLength,
+                    request.StableEntryId))
+                .ToList();
+            try
+            {
+                PendingRecoveryStore.Persist(stageDir, fileRequests);
+                preserveCompletedStage = true;
+            }
+            catch (Exception ex)
+            {
+                throw new RecoveryPublicationException(
+                    $"无法持久化接收文件的待提交标记: {stageDir}",
+                    durableStage: false, innerException: ex);
+            }
+            try
+            {
+                IReadOnlyList<ContentStore.PutResult> published =
+                    ContentStore.PutFileBatch(fileRequests);
+                preserveCompletedStage = false;
+                return published;
+            }
+            catch (Exception ex)
+            {
+                throw new RecoveryPublicationException(
+                    $"接收历史提交失败；完整数据已保留在 {stageDir}: {ex.Message}",
+                    durableStage: true, innerException: ex);
+            }
+        }
+        finally
+        {
+            if (!preserveCompletedStage)
+            {
+                try
+                {
+                    if (Directory.Exists(stageDir)) Directory.Delete(stageDir, recursive: true);
+                }
+                catch { /* Published blobs own successful copies. */ }
+            }
+        }
+    }
+
     private RecoveryResult StageSingleFile(byte[] bytes, string displayName,
-        ulong originalSize, ulong expectedCrc, bool crcKnown, ulong receivedCrc)
+        ulong originalSize, ulong expectedCrc, bool crcKnown, ulong receivedCrc,
+        string recoveryKey)
     {
         string finalName = string.IsNullOrEmpty(displayName) ? "received_file" : displayName;
         string crcHex = crcKnown ? expectedCrc.ToString("x") : "unknown";
-        ContentStore.PutResult put = ContentStore.PutBytes(
-            finalName, bytes, crcHex, crcUnknown: !crcKnown, kind: "file");
+        ContentStore.PutResult put = PublishRecoveredBytes([
+            new ContentStore.PutBytesRequest(
+                finalName, bytes, crcHex, CrcUnknown: !crcKnown, Kind: "file",
+                StableEntryId: $"af2-{recoveryKey}-0")
+        ]).Single();
         return new RecoveryResult(
             SingleFilePath: put.Path,
             SingleFileSize: originalSize > 0 ? originalSize : (ulong)bytes.Length,
@@ -1778,7 +2048,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     /// entry name (user-chosen on sender; default "文字消息.txt").
     /// </summary>
     private RecoveryResult StageText(string text, string displayName,
-        ulong expectedCrc, bool crcKnown, ulong receivedCrc)
+        ulong expectedCrc, bool crcKnown, ulong receivedCrc, string recoveryKey)
     {
         // Store the UTF-8 body, while retaining transport CRC
         // fields so corruption is not hidden by recomputing a different hash.
@@ -1788,8 +2058,11 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         byte[] contentBytes = Encoding.UTF8.GetBytes(text);
         ulong contentCrc = Crc32.Compute(contentBytes);
         string crcHex = contentCrc.ToString("x");
-        ContentStore.PutResult put = ContentStore.PutBytes(
-            finalName, contentBytes, crcHex, crcUnknown: false, kind: "text");
+        ContentStore.PutResult put = PublishRecoveredBytes([
+            new ContentStore.PutBytesRequest(
+                finalName, contentBytes, crcHex, CrcUnknown: false, Kind: "text",
+                StableEntryId: $"af2-{recoveryKey}-0")
+        ]).Single();
         return new RecoveryResult(
             SingleFilePath: put.Path,
             SingleFileSize: (ulong)contentBytes.Length,
@@ -1806,13 +2079,17 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     /// Stage a text-like single file into ContentStore and keep text for the copy UI.
     /// </summary>
     private RecoveryResult StageTextLikeFile(byte[] bytes, string displayName,
-        ulong originalSize, ulong expectedCrc, bool crcKnown, ulong receivedCrc, string text)
+        ulong originalSize, ulong expectedCrc, bool crcKnown, ulong receivedCrc, string text,
+        string recoveryKey)
     {
         string finalName = string.IsNullOrEmpty(displayName) ? "文字消息.txt" : displayName;
-        ContentStore.PutResult put = ContentStore.PutBytes(
-            finalName, bytes,
-            crcHex: crcKnown ? expectedCrc.ToString("x") : "unknown",
-            crcUnknown: !crcKnown, kind: "text");
+        ContentStore.PutResult put = PublishRecoveredBytes([
+            new ContentStore.PutBytesRequest(
+                finalName, bytes,
+                CrcHex: crcKnown ? expectedCrc.ToString("x") : "unknown",
+                CrcUnknown: !crcKnown, Kind: "text",
+                StableEntryId: $"af2-{recoveryKey}-0")
+        ]).Single();
         return new RecoveryResult(
             SingleFilePath: put.Path,
             SingleFileSize: originalSize > 0 ? originalSize : (ulong)bytes.Length,
@@ -1826,18 +2103,20 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     }
 
     private RecoveryResult? StageBundle(
-        IReadOnlyList<BundleFile> files, ulong expectedCrc, bool crcKnown, ulong receivedCrc)
+        IReadOnlyList<BundleFile> files, ulong expectedCrc, bool crcKnown, ulong receivedCrc,
+        string recoveryKey)
     {
         if (files.Count == 0)
         {
             return null;
         }
-        string bundleId = Guid.NewGuid().ToString("N");
+        string bundleId = $"af2-{recoveryKey}";
         string bundleTitle = $"发送_{DateTime.Now:MMdd_HHmmss}";
-        ContentStore.PutBytesBatch(files.Select(f =>
+        PublishRecoveredBytes(files.Select((f, index) =>
             new ContentStore.PutBytesRequest(
                 f.Name, f.Data, Kind: "file",
-                BundleId: bundleId, BundleTitle: bundleTitle)).ToList());
+                BundleId: bundleId, BundleTitle: bundleTitle,
+                StableEntryId: $"af2-{recoveryKey}-{index}")).ToList());
         return new RecoveryResult(
             SingleFilePath: null,
             SingleFileSize: null,

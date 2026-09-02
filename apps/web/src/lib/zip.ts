@@ -44,6 +44,62 @@ export interface ZipEntryInput {
   mtime?: Date
 }
 
+const ZIP_FALLBACK_NAME = "unnamed"
+
+/**
+ * Reduce an entry name to a relative, traversal-free archive path.
+ *
+ * Bundle entry names originate in a scanned AF2 manifest, i.e. they are
+ * attacker-controlled. `af2::manifest::validate_path` already rejects `..`,
+ * absolute paths and backslashes on the wire, but the archive is consumed by
+ * third-party extractors where a single stray `../` becomes an arbitrary file
+ * write ("zip slip"). Re-establish the invariant at the point the bytes are
+ * written so this builder is safe for any caller, not only the validated one.
+ */
+export function sanitizeZipEntryPath(name: string): string {
+  const segments = name
+    .replace(/\\/g, "/")
+    // Drive-relative ("C:dir") and rooted ("C:/dir") Windows prefixes.
+    .replace(/^[A-Za-z]:/, "")
+    .split("/")
+    // Control characters (NUL included) are illegal in archive members.
+    .map((segment) => segment.replace(/[\u0000-\u001f\u007f]/g, ""))
+    .filter((segment) => segment !== "" && segment !== "." && segment !== "..")
+  return segments.join("/") || ZIP_FALLBACK_NAME
+}
+
+/**
+ * Sanitization can collapse distinct attacker-controlled names (for example
+ * `C:report.txt` and `report.txt`) onto the same archive member. Many unzip
+ * tools silently let the later member overwrite the first one. Allocate a
+ * deterministic suffix, case-insensitively for Windows extractors, so every
+ * received entry remains addressable after extraction.
+ */
+function uniqueZipEntryPath(used: Set<string>, requestedPath: string): string {
+  const key = requestedPath.toLowerCase()
+  if (!used.has(key)) {
+    used.add(key)
+    return requestedPath
+  }
+
+  const slash = requestedPath.lastIndexOf("/")
+  const dir = slash >= 0 ? requestedPath.slice(0, slash + 1) : ""
+  const name = slash >= 0 ? requestedPath.slice(slash + 1) : requestedPath
+  const dot = name.lastIndexOf(".")
+  const stem = dot > 0 ? name.slice(0, dot) : name
+  const extension = dot > 0 ? name.slice(dot) : ""
+  let ordinal = 1
+  while (true) {
+    const candidate = `${dir}${stem} (${ordinal})${extension}`
+    const candidateKey = candidate.toLowerCase()
+    if (!used.has(candidateKey)) {
+      used.add(candidateKey)
+      return candidate
+    }
+    ordinal++
+  }
+}
+
 function dateToDosTimeDate(d: Date): { dosTime: number; dosDate: number } {
   const year = d.getFullYear()
   const month = d.getMonth() + 1
@@ -83,10 +139,11 @@ export async function createZipBlob(entries: ZipEntryInput[]): Promise<Blob> {
   const encoder = new TextEncoder()
   const localParts: BlobPart[] = []
   const centralParts: BlobPart[] = []
+  const usedPaths = new Set<string>()
   let currentOffset = 0n
 
   for (const entry of entries) {
-    const cleanPath = entry.name.replace(/\\/g, "/")
+    const cleanPath = uniqueZipEntryPath(usedPaths, sanitizeZipEntryPath(entry.name))
     const encodedName = encoder.encode(cleanPath)
     if (encodedName.length > 0xffff) throw new Error(`ZIP 文件名过长: ${entry.name}`)
     const data = asBlob(entry.data)

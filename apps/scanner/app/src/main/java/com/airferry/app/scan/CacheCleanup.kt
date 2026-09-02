@@ -54,13 +54,20 @@ object CacheCleanup {
                 if (shareDirty) {
                     prefs.edit().putBoolean(KEY_SHARE_DIRTY, false).apply()
                 }
-                // Interrupted §13 entry staging leaves `<uuid>.partial` temps
-                // behind; recovery wipes the dir at its own start, this covers
-                // a process kill before that ever runs.
-                val entryStage = File(cache, ENTRY_STAGE_DIR)
-                if (entryStage.exists() && entryStage.listFiles()?.isNotEmpty() == true) {
-                    if (entryStage.deleteRecursively()) removed++
+                // Complete+fsync'd receive entries carry a retry manifest.
+                // Replay those transactions before deciding which staging
+                // directories are merely interrupted garbage.
+                val retried = PendingRecoveryStore.retryAll(app)
+                if (retried.imported + retried.alreadyCommitted > 0) {
+                    Log.i(TAG, "recovered ${retried.imported} pending publication(s), " +
+                        "cleaned ${retried.alreadyCommitted} committed shell(s)")
                 }
+                // Interrupted §13 entry staging leaves per-attempt directories
+                // behind. Remove incomplete attempts, but retain a `.keep`-marked
+                // directory: it contains complete files restored after a failed
+                // ContentStore index commit and may be the only recovery copy.
+                val entryStage = File(cache, ENTRY_STAGE_DIR)
+                removed += purgeInterruptedEntryStages(entryStage)
             } catch (e: Exception) {
                 Log.w(TAG, "purgeOnAppStart failed", e)
             }
@@ -70,5 +77,23 @@ object CacheCleanup {
         if (removed > 0) {
             Log.i(TAG, "purged $removed legacy cache entr(y/ies)")
         }
+    }
+
+    /** Delete interrupted/partial staging attempts while retaining complete
+     * rollback copies explicitly marked by the recovery publisher. */
+    internal fun purgeInterruptedEntryStages(entryStage: File): Int {
+        var removed = 0
+        entryStage.listFiles()?.forEach { attempt ->
+            // A marker-only shell can remain if the process died just after
+            // ContentStore committed and consumed every source. Do not retain
+            // that empty directory forever.
+            val keepMarker = File(attempt, PendingRecoveryStore.MANIFEST_NAME).isFile ||
+                File(attempt, ".keep").isFile // legacy builds lacked retry metadata
+            val keep = attempt.isDirectory && keepMarker &&
+                attempt.walkTopDown().any { it.isFile && it.name.endsWith(".partial") }
+            if (!keep && attempt.deleteRecursively()) removed++
+        }
+        if (entryStage.listFiles()?.isEmpty() == true) entryStage.delete()
+        return removed
     }
 }

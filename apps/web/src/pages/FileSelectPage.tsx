@@ -197,11 +197,19 @@ export function FileSelectPage({ items, onItemsChange, onPlay, busyLabel }: Prop
   const appendIncomingFiles = useCallback(
     (incoming: File[]) => {
       if (!mountedRef.current || incoming.length === 0) return
-      const next = appendFiles(itemsRef.current, incoming)
-      // Publish immediately so overlapping async picker/drop completions append
-      // to the newest list even before React has rendered the parent update.
-      itemsRef.current = next
-      onItemsChange(next)
+      try {
+        const next = appendFiles(itemsRef.current, incoming)
+        // Publish immediately so overlapping async picker/drop completions append
+        // to the newest list even before React has rendered the parent update.
+        itemsRef.current = next
+        onItemsChange(next)
+        setDropError(null)
+      } catch (err) {
+        // Path validation is intentionally performed before the hash pass.
+        // Surface it in-page instead of letting a picker event throw through
+        // React (or making the File System Access fallback open a second dialog).
+        setDropError(err instanceof Error ? err.message : "文件路径不符合 AF2 协议约束")
+      }
     },
     [onItemsChange]
   )

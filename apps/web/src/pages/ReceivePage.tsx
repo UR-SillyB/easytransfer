@@ -321,6 +321,10 @@ export function ReceivePage(): React.ReactElement {
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
+  /** Guards 开始接收 while a source prompt / worker init is still in flight:
+   * a second concurrent start terminates the first run's workers, whose
+   * ready-barrier then never settles and fails the working scan 15 s later. */
+  const startingRef = useRef<boolean>(false)
   const recvWorkerRef = useRef<Worker | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const jobIdRef = useRef<number>(0)
@@ -435,6 +439,15 @@ export function ReceivePage(): React.ReactElement {
 
   /** Attach a stream to the shared video element. */
   const attachStream = useCallback((stream: MediaStream) => {
+    // Overlapping start attempts (a double-tap on 开始接收 races two
+    // getUserMedia/getDisplayMedia prompts) each resolve with their own
+    // MediaStream. Only the last one lands in the ref, and teardown() stops
+    // only what the ref holds — so without this the earlier stream is
+    // orphaned and the camera stays live for the page's lifetime.
+    const previous = streamRef.current
+    if (previous && previous !== stream) {
+      for (const track of previous.getTracks()) track.stop()
+    }
     streamRef.current = stream
     const video = videoRef.current
     if (video) {
@@ -1113,6 +1126,10 @@ export function ReceivePage(): React.ReactElement {
           recovered: rec,
           name,
         })
+        // Result state now owns the Blob/text payload. Only after this point
+        // may the worker delete its crash-resume journal and release (but not
+        // unlink) the lazy OPFS backing.
+        recv.postMessage({ type: "result_ack", jobId: jobIdRef.current })
         const tid = activeTransferIdRef.current
         const textContent = kind === "text" ? (rec as { text: string }).text : undefined
         recordCompletedTransfer(
@@ -1340,6 +1357,12 @@ export function ReceivePage(): React.ReactElement {
     recvWorkerRef.current?.postMessage({ type: "reset", jobId: jobIdRef.current })
     rateSamplesRef.current = []
     transferStartMsRef.current = 0
+    activeTransferIdRef.current = ""
+    activeNameRef.current = ""
+    activeTotalSizeRef.current = 0
+    activeEntryCountRef.current = 1
+    activeChunkCountRef.current = 1
+    lastPartialRecordRef.current = 0
     setResult(null)
     setError(null)
     stageRef.current = "camera"
@@ -1426,7 +1449,13 @@ export function ReceivePage(): React.ReactElement {
             <div className="receive-actions">
               <button
                 onClick={async () => {
-                  if (await startSelectedSource()) await startScanning()
+                  if (startingRef.current) return
+                  startingRef.current = true
+                  try {
+                    if (await startSelectedSource()) await startScanning()
+                  } finally {
+                    startingRef.current = false
+                  }
                 }}
                 className="btn primary"
               >
@@ -1461,7 +1490,23 @@ export function ReceivePage(): React.ReactElement {
         <span className="app-footer-hint">AirFerry · 无网文件传输</span>
       </footer>
 
-      <HistoryModal isOpen={historyOpen} onClose={() => setHistoryOpen(false)} />
+      <HistoryModal
+        isOpen={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+        protectedTransferId={
+          (scanningActiveRef.current || stage === "recovering" || (stage === "done" && !!result))
+            ? activeTransferIdRef.current
+            : ""
+        }
+        getProtectedTransferIds={() => {
+          const id = activeTransferIdRef.current
+          const inUse =
+            scanningActiveRef.current ||
+            stageRef.current === "recovering" ||
+            (stageRef.current === "done" && result !== null)
+          return id && inUse ? [id] : []
+        }}
+      />
     </div>
   )
 }

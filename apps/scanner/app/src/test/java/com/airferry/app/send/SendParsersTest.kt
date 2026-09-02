@@ -87,6 +87,11 @@ class SendParsersTest {
     }
 
     @Test(expected = IllegalArgumentException::class)
+    fun qrBatchRejectsTruncatedTileHeader() {
+        parseQrBatch(byteArrayOf(1, 0, 0, 0))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
     fun qrBatchRejectsTrailingBytes() {
         parseQrBatch(packedBatch(21) + byteArrayOf(1, 2, 3))
     }
@@ -102,5 +107,54 @@ class SendParsersTest {
         assertNull(parseNotStagedIndex("AF2_CHUNK_NOT_STAGED:"))
         assertNull(parseNotStagedIndex("some other error"))
         assertNull(parseNotStagedIndex(null))
+    }
+
+    @Test
+    fun duplicateSendNamesAreDisambiguatedBeforeHashing() {
+        val used = mutableSetOf<String>()
+        assertEquals("report.pdf", uniqueSendDisplayName(used, "report.pdf"))
+        assertEquals("report (1).pdf", uniqueSendDisplayName(used, "report.pdf"))
+        assertEquals("report (2).pdf", uniqueSendDisplayName(used, "report.pdf"))
+    }
+
+    @Test
+    fun canonicallyEquivalentSendNamesCollide() {
+        val used = mutableSetOf<String>()
+        assertEquals("é.txt", uniqueSendDisplayName(used, "e\u0301.txt"))
+        assertEquals("é (1).txt", uniqueSendDisplayName(used, "é.txt"))
+    }
+
+    @Test
+    fun duplicateMaxLengthSendNameStaysWithinWireComponentLimit() {
+        val used = mutableSetOf<String>()
+        val name = "a".repeat(251) + ".txt"
+        assertEquals(name, uniqueSendDisplayName(used, name))
+        val duplicate = uniqueSendDisplayName(used, name)
+        assertEquals("a".repeat(247) + " (1).txt", duplicate)
+        assertTrue(duplicate.toByteArray(Charsets.UTF_8).size <= 255)
+    }
+
+    @Test
+    fun sendBudgetMatchesSmallestBundledReceiverAndDoesNotOverflow() {
+        val atLimit = listOf(
+            SendItem(SendItem.KIND_FILE, "a.bin", MAX_INTEROPERABLE_SEND_BYTES),
+        )
+        assertEquals(MAX_INTEROPERABLE_SEND_BYTES, validateSendItems(atLimit))
+
+        val overflowing = listOf(
+            SendItem(SendItem.KIND_FILE, "huge.bin", Long.MAX_VALUE),
+            SendItem(SendItem.KIND_FILE, "more.bin", Long.MAX_VALUE),
+        )
+        try {
+            validateSendItems(overflowing)
+            throw AssertionError("oversized selection must be rejected")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message.orEmpty().contains("8 GiB"))
+        }
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun sendBudgetRejectsAnAllEmptySelection() {
+        validateSendItems(listOf(SendItem(SendItem.KIND_FILE, "empty.bin", 0)))
     }
 }
